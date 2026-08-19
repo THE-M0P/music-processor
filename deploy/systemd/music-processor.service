@@ -1,0 +1,36 @@
+[Unit]
+Description=Process uploaded music files
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/mnt/music
+
+[Service]
+Type=oneshot
+User=mop
+Group=mop
+WorkingDirectory=/opt/music-processor
+EnvironmentFile=/etc/music-processor.env
+ExecStart=/opt/music-processor/.venv/bin/music-processor
+RuntimeDirectory=music-processor
+RuntimeDirectoryMode=0750
+UMask=0022
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/mnt/music
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
