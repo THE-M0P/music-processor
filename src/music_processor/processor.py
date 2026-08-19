@@ -10,9 +10,11 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from music_processor.clients import AcoustIDClient, FingerprintResult, MusicBrainzClient
 from music_processor.config import Settings
+from music_processor.fingerprint import acoustic_content_digest
 from music_processor.naming import (
     artists_match,
     canonical_song_title,
@@ -27,6 +29,7 @@ from music_processor.naming import (
     safe_name,
     split_upload_filename,
 )
+from music_processor.source_registry import SourceRecord, SourceRegistry
 from music_processor.tags import (
     SUPPORTED_EXTENSIONS,
     TaggingError,
@@ -51,6 +54,27 @@ class ProcessingSummary:
     deferred: int = 0
     failed: int = 0
     duplicates_removed: int = 0
+    sources_updated: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ResolutionContext:
+    current: Tags
+    artist: str
+    album_artist: str
+    source_title: str
+    guessed_artist: str
+    guessed_title: str
+    release_title: str
+    chapter_count: int
+    is_release_upload: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SourceComparison:
+    existing: Path | None = None
+    incoming_digest: str = ""
+    result: Literal["none", "same", "different", "unverified"] = "none"
 
 
 class MusicProcessor:
@@ -63,6 +87,7 @@ class MusicProcessor:
         self.settings = settings
         self.musicbrainz = musicbrainz
         self.acoustid = acoustid
+        self.source_registry = SourceRegistry(settings.source_db)
 
     def process_pending(self) -> ProcessingSummary:
         if not self.settings.uploads.is_dir():
@@ -109,6 +134,26 @@ class MusicProcessor:
             summary.quarantined += 1
             return
 
+        self._process_audio(path, summary)
+
+    def _process_audio(self, path: Path, summary: ProcessingSummary) -> None:
+        context = self._resolution_context(path)
+        LOGGER.info(
+            "Read metadata for %s: artist=%r albumartist=%r album=%r title=%r",
+            path.name,
+            context.artist,
+            context.album_artist,
+            context.current.album,
+            context.current.title,
+        )
+        tags = self._resolve_tags(path, context)
+        if tags is None:
+            self._quarantine(path, "unidentified")
+            summary.quarantined += 1
+            return
+        self._finish_import(path, tags, summary)
+
+    def _resolution_context(self, path: Path) -> ResolutionContext:
         current = read_tags(path)
         tagged_artist = normalise_artist_case(current.artist.strip())
         artist = tagged_artist
@@ -123,32 +168,6 @@ class MusicProcessor:
         ):
             album_artist = primary_artist(artist)
         source_title = current.source_title or current.title or self._filename_title(path)
-        LOGGER.info(
-            "Read metadata for %s: artist=%r albumartist=%r album=%r title=%r",
-            path.name,
-            artist,
-            album_artist,
-            current.album,
-            current.title,
-        )
-
-        if artist and current.album:
-            tags = Tags(
-                artist=artist,
-                album_artist=album_artist or artist,
-                album=clean_album(current.album),
-                title=clean_title(current.title or source_title, artist),
-                source_title=source_title,
-                match_source=current.match_source or "existing-tags",
-                confidence=current.confidence or 1.0,
-                recording_id=current.recording_id,
-                release_group_id=current.release_group_id,
-                acoustid_id=current.acoustid_id,
-                source_url=current.source_url,
-            )
-            self._finish_import(path, tags, summary)
-            return
-
         guessed_artist, guessed_title = self._guess_from_filename(
             path,
             artist,
@@ -160,82 +179,149 @@ class MusicProcessor:
         is_release_upload = (
             duration >= 20 * 60 or chapter_count > 1 or release_title != guessed_title
         )
-        cleaned_source_title = clean_title(source_title, artist)
-        if is_release_upload:
+        return ResolutionContext(
+            current=current,
+            artist=artist,
+            album_artist=album_artist,
+            source_title=source_title,
+            guessed_artist=guessed_artist,
+            guessed_title=guessed_title,
+            release_title=release_title,
+            chapter_count=chapter_count,
+            is_release_upload=is_release_upload,
+        )
+
+    def _resolve_tags(self, path: Path, context: ResolutionContext) -> Tags | None:
+        if context.artist and context.current.album:
+            return self._existing_tags(context)
+
+        cleaned_source_title = clean_title(context.source_title, context.artist)
+        if context.is_release_upload:
             LOGGER.info("Skipping single-recording fingerprint for release upload %s", path.name)
             fingerprint = FingerprintResult()
         else:
-            fingerprint = self._fingerprint(path, artist, cleaned_source_title)
+            fingerprint = self._fingerprint(path, context.artist, cleaned_source_title)
         if fingerprint.artist or fingerprint.title:
-            final_artist = preferred_artist_name(artist, fingerprint.artist)
-            if fingerprint.album_artist and not artists_match(
-                fingerprint.album_artist,
-                final_artist,
-            ):
-                final_album_artist = fingerprint.album_artist
-            else:
-                final_album_artist = primary_artist(final_artist)
-            final_title = merge_version_title(
-                fingerprint.title or cleaned_source_title,
-                cleaned_source_title,
-            )
-            album = (
-                self.musicbrainz.find_earliest_studio_album(
-                    final_album_artist,
-                    canonical_song_title(final_title),
-                )
-                or fingerprint.album
-            )
-            tags = Tags(
-                artist=final_artist,
-                album_artist=final_album_artist or final_artist,
-                album=album,
-                title=final_title,
-                source_title=source_title,
-                match_source="acoustid",
-                confidence=fingerprint.score,
-                recording_id=fingerprint.recording_id,
-                release_group_id=fingerprint.release_group_id,
-                acoustid_id=fingerprint.acoustid_id,
-                source_url=current.source_url,
-            )
-            self._finish_import(path, tags, summary)
-            return
+            return self._fingerprint_tags(context, fingerprint, cleaned_source_title)
+        return self._filename_tags(context)
 
-        if not guessed_artist and not guessed_title:
-            self._quarantine(path, "unidentified")
-            summary.quarantined += 1
-            return
+    @staticmethod
+    def _existing_tags(context: ResolutionContext) -> Tags:
+        current = context.current
+        return Tags(
+            artist=context.artist,
+            album_artist=context.album_artist or context.artist,
+            album=clean_album(current.album),
+            title=clean_title(current.title or context.source_title, context.artist),
+            source_title=context.source_title,
+            match_source=current.match_source or "existing-tags",
+            confidence=current.confidence or 1.0,
+            recording_id=current.recording_id,
+            release_group_id=current.release_group_id,
+            acoustid_id=current.acoustid_id,
+            source_url=current.source_url,
+            artist_source=current.artist_source or "existing-tags",
+            album_artist_source=current.album_artist_source or "existing-tags",
+            album_source=current.album_source or "existing-tags",
+            title_source=current.title_source or "existing-tags",
+        )
 
-        guessed_album = ""
-        lookup_artist = album_artist or primary_artist(guessed_artist)
-        if lookup_artist and guessed_title:
-            guessed_album = self.musicbrainz.find_earliest_studio_album(
-                lookup_artist,
-                canonical_song_title(guessed_title),
-            )
-            if not guessed_album and is_release_upload:
-                guessed_album = self.musicbrainz.find_studio_album_release(
-                    lookup_artist,
-                    release_title,
-                )
-            if release_title != guessed_title and (
-                not guessed_album or artists_match(guessed_album, guessed_artist)
-            ):
-                guessed_album = clean_album(release_title)
-            if not guessed_album and chapter_count > 1:
-                guessed_album = clean_album(guessed_title)
-        tags = Tags(
-            artist=guessed_artist,
-            album_artist=lookup_artist or guessed_artist,
+    def _fingerprint_tags(
+        self,
+        context: ResolutionContext,
+        fingerprint: FingerprintResult,
+        cleaned_source_title: str,
+    ) -> Tags:
+        final_artist = preferred_artist_name(context.artist, fingerprint.artist)
+        if fingerprint.album_artist and not artists_match(
+            fingerprint.album_artist,
+            final_artist,
+        ):
+            final_album_artist = fingerprint.album_artist
+            album_artist_source = "acoustid"
+        else:
+            final_album_artist = primary_artist(final_artist)
+            album_artist_source = "derived-artist"
+        final_title = merge_version_title(
+            fingerprint.title or cleaned_source_title,
+            cleaned_source_title,
+        )
+        album = self.musicbrainz.find_earliest_studio_album(
+            final_album_artist,
+            canonical_song_title(final_title),
+        )
+        album_source = "musicbrainz" if album else ""
+        if not album and fingerprint.album:
+            album = fingerprint.album
+            album_source = "acoustid-release"
+        return Tags(
+            artist=final_artist,
+            album_artist=final_album_artist or final_artist,
+            album=album,
+            title=final_title,
+            source_title=context.source_title,
+            match_source="acoustid",
+            confidence=fingerprint.score,
+            recording_id=fingerprint.recording_id,
+            release_group_id=fingerprint.release_group_id,
+            acoustid_id=fingerprint.acoustid_id,
+            source_url=context.current.source_url,
+            artist_source="source+acoustid" if context.artist else "acoustid",
+            album_artist_source=album_artist_source,
+            album_source=album_source,
+            title_source=("acoustid+source-version" if fingerprint.title else "source-title"),
+        )
+
+    def _filename_tags(self, context: ResolutionContext) -> Tags | None:
+        if not context.guessed_artist and not context.guessed_title:
+            return None
+        lookup_artist = context.album_artist or primary_artist(context.guessed_artist)
+        guessed_album, album_source = self._filename_album(context, lookup_artist)
+        return Tags(
+            artist=context.guessed_artist,
+            album_artist=lookup_artist or context.guessed_artist,
             album=guessed_album,
-            title=guessed_title,
-            source_title=source_title,
+            title=context.guessed_title,
+            source_title=context.source_title,
             match_source="filename",
             confidence=0.25,
-            source_url=current.source_url,
+            source_url=context.current.source_url,
+            artist_source="filename",
+            album_artist_source="derived-artist",
+            album_source=album_source,
+            title_source="filename",
         )
-        self._finish_import(path, tags, summary)
+
+    def _filename_album(
+        self,
+        context: ResolutionContext,
+        lookup_artist: str,
+    ) -> tuple[str, str]:
+        guessed_album = ""
+        album_source = ""
+        if lookup_artist and context.guessed_title:
+            guessed_album = self.musicbrainz.find_earliest_studio_album(
+                lookup_artist,
+                canonical_song_title(context.guessed_title),
+            )
+            if guessed_album:
+                album_source = "musicbrainz"
+            if not guessed_album and context.is_release_upload:
+                guessed_album = self.musicbrainz.find_studio_album_release(
+                    lookup_artist,
+                    context.release_title,
+                )
+                if guessed_album:
+                    album_source = "musicbrainz-release"
+            if context.release_title != context.guessed_title and (
+                not guessed_album or artists_match(guessed_album, context.guessed_artist)
+            ):
+                guessed_album = clean_album(context.release_title)
+                album_source = "filename-self-titled"
+            if not guessed_album and context.chapter_count > 1:
+                guessed_album = clean_album(context.guessed_title)
+                album_source = "filename-release"
+        return guessed_album, album_source
 
     def _fingerprint(self, path: Path, artist: str, title: str) -> FingerprintResult:
         if self.acoustid is None:
@@ -253,7 +339,43 @@ class MusicProcessor:
         tags: Tags,
         summary: ProcessingSummary,
     ) -> None:
-        final_tags = Tags(
+        final_tags = self._final_tags(path, tags)
+        base_destination = self._base_library_destination(path, final_tags)
+        comparison = self._compare_source(path, base_destination, final_tags.source_url)
+        if comparison.result == "same" and comparison.existing is not None:
+            self._handle_matching_source(
+                path,
+                comparison.existing,
+                base_destination,
+                final_tags,
+                comparison.incoming_digest,
+                summary,
+            )
+            return
+
+        register_source = comparison.result in {"none", "same"}
+        action = "imported"
+        if comparison.result in {"different", "unverified"}:
+            register_source = False
+            action = f"source-content-{comparison.result}"
+            LOGGER.warning(
+                "Retaining %s because source identity matches %s but audio equality is %s",
+                path.name,
+                comparison.existing,
+                "not confirmed" if comparison.result == "unverified" else "different",
+            )
+        self._import_new(
+            path,
+            base_destination,
+            final_tags,
+            summary,
+            content_digest=comparison.incoming_digest,
+            register_source=register_source,
+            action=action,
+        )
+
+    def _final_tags(self, path: Path, tags: Tags) -> Tags:
+        return Tags(
             artist=tags.artist or "Unknown Artist",
             album_artist=tags.album_artist or tags.artist or "Unknown Artist",
             title=tags.title or path.stem,
@@ -265,34 +387,49 @@ class MusicProcessor:
             release_group_id=tags.release_group_id,
             acoustid_id=tags.acoustid_id,
             source_url=tags.source_url,
+            artist_source=tags.artist_source or "fallback",
+            album_artist_source=tags.album_artist_source or "derived-artist",
+            album_source=tags.album_source or "fallback",
+            title_source=tags.title_source or "fallback",
         )
-        base_destination = self._base_library_destination(path, final_tags)
-        duplicate = self._matching_source_destination(
-            base_destination,
-            final_tags.source_url,
-        )
-        if duplicate is not None:
-            if self.settings.dry_run:
-                LOGGER.info(
-                    "Dry run: would remove duplicate %s already imported as %s", path, duplicate
-                )
-            else:
-                path.unlink()
-                try:
-                    self._record_decision(
-                        path,
-                        duplicate,
-                        final_tags,
-                        action="duplicate-removed",
-                    )
-                except OSError:
-                    LOGGER.exception("Could not append duplicate decision for %s", path.name)
-                LOGGER.info(
-                    "Removed duplicate download %s already imported as %s", path.name, duplicate
-                )
-            summary.duplicates_removed += 1
-            return
 
+    def _compare_source(
+        self,
+        path: Path,
+        base_destination: Path,
+        source_url: str,
+    ) -> SourceComparison:
+        registered = self.source_registry.lookup(source_url)
+        existing = self._registered_path(registered) or self._matching_source_destination(
+            base_destination,
+            source_url,
+        )
+        if existing is None:
+            return SourceComparison()
+        incoming_digest = acoustic_content_digest(path)
+        existing_digest = (
+            registered.content_digest
+            if registered is not None and registered.path == existing
+            else ""
+        ) or acoustic_content_digest(existing)
+        if not incoming_digest or not existing_digest:
+            return SourceComparison(existing, incoming_digest, "unverified")
+        result: Literal["same", "different"] = (
+            "same" if incoming_digest == existing_digest else "different"
+        )
+        return SourceComparison(existing, incoming_digest, result)
+
+    def _import_new(
+        self,
+        path: Path,
+        base_destination: Path,
+        final_tags: Tags,
+        summary: ProcessingSummary,
+        *,
+        content_digest: str,
+        register_source: bool,
+        action: str,
+    ) -> None:
         destination = self._available_path(base_destination)
 
         if self.settings.dry_run:
@@ -310,8 +447,10 @@ class MusicProcessor:
 
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(path), destination)
+        if register_source and final_tags.source_url:
+            self.source_registry.register(final_tags.source_url, destination, content_digest)
         try:
-            self._record_decision(path, destination, final_tags)
+            self._record_decision(path, destination, final_tags, action=action)
         except OSError:
             LOGGER.exception("Could not append import decision for %s", destination)
         LOGGER.info(
@@ -321,6 +460,84 @@ class MusicProcessor:
             final_tags.confidence,
         )
         summary.imported += 1
+
+    def _registered_path(self, record: SourceRecord | None) -> Path | None:
+        if record is None or record.path.is_symlink() or not record.path.is_file():
+            return None
+        try:
+            record.path.resolve().relative_to(self.settings.library.resolve())
+        except (OSError, ValueError):
+            LOGGER.warning("Ignoring source registry path outside the library: %s", record.path)
+            return None
+        return record.path
+
+    def _handle_matching_source(
+        self,
+        path: Path,
+        existing: Path,
+        base_destination: Path,
+        tags: Tags,
+        content_digest: str,
+        summary: ProcessingSummary,
+    ) -> None:
+        existing_tags = read_tags(existing)
+        metadata_matches = self._resolved_metadata_matches(existing_tags, tags)
+        if metadata_matches and existing == base_destination:
+            if self.settings.dry_run:
+                LOGGER.info(
+                    "Dry run: would remove duplicate %s already imported as %s",
+                    path,
+                    existing,
+                )
+            else:
+                path.unlink()
+                self.source_registry.register(tags.source_url, existing, content_digest)
+                self._safe_record_decision(path, existing, tags, action="duplicate-removed")
+                LOGGER.info(
+                    "Removed duplicate download %s already imported as %s",
+                    path.name,
+                    existing,
+                )
+            summary.duplicates_removed += 1
+            return
+
+        destination = base_destination
+        if destination.exists() and destination != existing:
+            destination = self._available_path(destination)
+        if self.settings.dry_run:
+            LOGGER.info(
+                "Dry run: would update source %s from %s to %s",
+                path.name,
+                existing,
+                destination,
+            )
+            summary.sources_updated += 1
+            return
+        try:
+            write_tags(path, tags)
+        except TaggingError as error:
+            LOGGER.error("%s", error)
+            self._quarantine(path, "tagging-error")
+            summary.failed += 1
+            return
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), destination)
+        if existing != destination:
+            existing.unlink()
+        self.source_registry.register(tags.source_url, destination, content_digest)
+        self._safe_record_decision(path, destination, tags, action="source-updated")
+        LOGGER.info("Updated source %s at %s", tags.source_url, destination)
+        summary.sources_updated += 1
+
+    @staticmethod
+    def _resolved_metadata_matches(existing: Tags, resolved: Tags) -> bool:
+        return (
+            existing.artist == resolved.artist
+            and existing.album_artist == resolved.album_artist
+            and existing.album == resolved.album
+            and existing.title == resolved.title
+        )
 
     def _base_library_destination(self, path: Path, tags: Tags) -> Path:
         album_artist = safe_name(tags.album_artist or tags.artist, "Unknown Artist")
@@ -376,6 +593,19 @@ class MusicProcessor:
         }
         with self.settings.decision_log.open("a", encoding="utf-8") as output:
             output.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def _safe_record_decision(
+        self,
+        source: Path,
+        destination: Path,
+        tags: Tags,
+        *,
+        action: str,
+    ) -> None:
+        try:
+            self._record_decision(source, destination, tags, action=action)
+        except OSError:
+            LOGGER.exception("Could not append %s decision for %s", action, destination)
 
     @staticmethod
     def _available_path(path: Path) -> Path:

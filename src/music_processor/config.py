@@ -15,6 +15,7 @@ class Settings:
     acoustid_api_key: str | None
     musicbrainz_contact: str
     decision_log: Path | None = None
+    source_db: Path | None = None
     fallback_album: str = "Singles & Miscellaneous"
     stability_wait: float = 2.0
     request_timeout: float = 15.0

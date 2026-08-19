@@ -24,6 +24,10 @@ def test_wav_tags_round_trip(tmp_path: Path) -> None:
         release_group_id="release-group-id",
         acoustid_id="acoustid-id",
         source_url="https://www.youtube.com/watch?v=video-id",
+        artist_source="source+acoustid",
+        album_artist_source="derived-artist",
+        album_source="musicbrainz",
+        title_source="acoustid+source-version",
     )
     write_tags(path, expected)
 

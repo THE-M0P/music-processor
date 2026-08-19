@@ -9,7 +9,6 @@ description = "Identify, clean, tag, and organise uploaded music files."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "musicbrainzngs>=0.7.1,<1",
     "mutagen>=1.47,<2",
     "requests>=2.31,<3",
 ]

@@ -36,10 +36,13 @@ not treated as artist separators, so names such as `Tyler, The Creator` remain i
   directories under the failed-file path.
 - Name collisions retain both files by adding `(2)`, `(3)`, and so on. The processor never assumes
   that matching artist and title strings prove two recordings are duplicates.
-- A repeated download with the same embedded source URL and destination is removed instead of
-  creating another numbered copy. Different source URLs still retain both files.
+- A repeated download is removed only when its source identity and acoustic content match an
+  existing import. If improved metadata changes the destination, the registered source is safely
+  replaced at the corrected path. Different or unverified audio is retained for review.
 - Every successful import can be recorded as JSON Lines, including its metadata source, confidence,
   original title, source URL, destination, and available external identifiers.
+- Artist, album artist, album, and title each retain their own provenance so later corrections can
+  distinguish existing tags, filename evidence, AcoustID matches, MusicBrainz matches, and fallbacks.
 
 MeTube should use a temporary directory below its private state directory rather than the watched
 upload directory. For example:
@@ -87,6 +90,7 @@ The default paths match a library mounted at `/mnt/music`:
 | Failed files | `/mnt/music/failed` | `MUSIC_QUARANTINE_DIR` |
 | Instance lock | User runtime or temporary directory | `MUSIC_PROCESSOR_LOCK_FILE` |
 | Decision log | Disabled | `MUSIC_PROCESSOR_DECISION_LOG` |
+| Source registry | `/mnt/music/.processor/sources.db` | `MUSIC_PROCESSOR_SOURCE_DB` |
 | Fallback album | `Singles & Miscellaneous` | `MUSIC_PROCESSOR_FALLBACK_ALBUM` |
 | MusicBrainz contact | Project URL | `MUSICBRAINZ_CONTACT` |
 | Log level | `INFO` | `MUSIC_PROCESSOR_LOG_LEVEL` |
@@ -94,6 +98,12 @@ The default paths match a library mounted at `/mnt/music`:
 
 Command-line path options override the corresponding environment variables. Run
 `music-processor --help` for the complete interface.
+
+Inspect quarantined files without modifying them:
+
+```console
+.venv/bin/music-processor --report-quarantine
+```
 
 ## Systemd deployment
 

@@ -1,10 +1,32 @@
 import logging
-import subprocess
 from pathlib import Path
 
 import requests
 
 from music_processor.clients import AcoustIDClient, FingerprintResult, MusicBrainzClient
+from music_processor.fingerprint import FingerprintData
+
+
+class FakeResponse:
+    def __init__(self, payload) -> None:
+        self.payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self):
+        return self.payload
+
+
+class QueueSession:
+    def __init__(self, *payloads) -> None:
+        self.payloads = list(payloads)
+        self.headers: dict[str, str] = {}
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return FakeResponse(self.payloads.pop(0))
 
 
 def test_acoustid_selects_matching_recording_instead_of_highest_wrong_artist() -> None:
@@ -129,14 +151,8 @@ def test_acoustid_request_error_does_not_log_api_key(monkeypatch, caplog, tmp_pa
             raise requests.Timeout(f"request failed with client={secret}&fingerprint={fingerprint}")
 
     monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=f'{{"duration": 10, "fingerprint": "{fingerprint}"}}',
-            stderr="",
-        ),
+        "music_processor.clients.calculate_fingerprint",
+        lambda path: FingerprintData(duration=10, fingerprint=fingerprint),
     )
     client = AcoustIDClient(secret, session=FailingSession())  # type: ignore[arg-type]
 
@@ -148,98 +164,96 @@ def test_acoustid_request_error_does_not_log_api_key(monkeypatch, caplog, tmp_pa
     assert fingerprint not in caplog.text
 
 
-def test_short_track_limits_fpcalc_below_audio_duration(monkeypatch, tmp_path: Path) -> None:
-    commands: list[list[str]] = []
-    monkeypatch.setattr("music_processor.clients.audio_duration", lambda path: 66.2)
-
-    def run(command, **kwargs):
-        commands.append(command)
-        return subprocess.CompletedProcess(command, 0, '{"duration": 65, "fingerprint": ""}', "")
-
-    monkeypatch.setattr(subprocess, "run", run)
-
-    assert AcoustIDClient("key").fingerprint(tmp_path / "short.mp3") == FingerprintResult()
-    assert commands == [["fpcalc", "-json", "-length", "65", str(tmp_path / "short.mp3")]]
-
-
-def test_musicbrainz_searches_enough_recordings_to_find_studio_album(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "music_processor.clients.musicbrainzngs.search_artists",
-        lambda **kwargs: {
-            "artist-list": [{"id": "artist-id", "name": "Pearl Jam", "ext:score": "100"}]
-        },
-    )
-
-    def search_recordings(**kwargs):
-        assert kwargs["limit"] == 100
-        return {
-            "recording-list": [
+def test_musicbrainz_searches_enough_recordings_to_find_studio_album() -> None:
+    session = QueueSession(
+        {"artists": [{"id": "artist-id", "name": "Pearl Jam", "score": 100}]},
+        {
+            "recordings": [
                 {
-                    "release-list": [
+                    "releases": [
                         {
                             "title": "Bootleg",
                             "status": "Bootleg",
                             "date": "1992",
                             "release-group": {
-                                "type": "Live",
-                                "secondary-type-list": ["Live"],
+                                "primary-type": "Album",
+                                "secondary-types": ["Live"],
                             },
                         },
                         {
                             "title": "Ten",
                             "status": "Official",
                             "date": "2009-03-24",
-                            "release-group": {"type": "Album", "secondary-type-list": []},
+                            "release-group": {
+                                "primary-type": "Album",
+                                "secondary-types": [],
+                            },
                         },
                     ]
                 }
             ]
-        }
-
-    monkeypatch.setattr(
-        "music_processor.clients.musicbrainzngs.search_recordings",
-        search_recordings,
+        },
     )
-    client = MusicBrainzClient("https://example.com")
+    client = MusicBrainzClient("https://example.com", session=session)  # type: ignore[arg-type]
 
     assert client.find_earliest_studio_album("Pearl Jam", "Alive") == "Ten"
+    assert session.calls[1][1]["params"]["limit"] == 100
+    assert session.calls[1][1]["timeout"] == 15.0
+    assert session.headers["User-Agent"].startswith("music-upload-processor/0.1.0")
 
 
-def test_musicbrainz_recognises_long_form_album_title(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "music_processor.clients.musicbrainzngs.search_artists",
-        lambda **kwargs: {"artist-list": [{"id": "artist-id", "name": "TISM", "ext:score": "100"}]},
-    )
-    monkeypatch.setattr(
-        "music_processor.clients.musicbrainzngs.search_release_groups",
-        lambda **kwargs: {
-            "release-group-list": [
+def test_musicbrainz_recognises_long_form_album_title() -> None:
+    session = QueueSession(
+        {"artists": [{"id": "artist-id", "name": "TISM", "score": 100}]},
+        {
+            "release-groups": [
                 {
                     "title": "Hot Dogma",
                     "primary-type": "Album",
-                    "ext:score": "100",
+                    "secondary-types": [],
+                    "score": 100,
                 }
             ]
         },
     )
-    client = MusicBrainzClient("https://example.com")
+    client = MusicBrainzClient("https://example.com", session=session)  # type: ignore[arg-type]
 
     assert client.find_studio_album_release("TISM", "Hot Dogma (1990)") == "Hot Dogma"
 
 
-def test_musicbrainz_accepts_ep_release_group(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "music_processor.clients.musicbrainzngs.search_artists",
-        lambda **kwargs: {"artist-list": [{"id": "artist-id", "name": "Snõõper"}]},
-    )
-    monkeypatch.setattr(
-        "music_processor.clients.musicbrainzngs.search_release_groups",
-        lambda **kwargs: {
-            "release-group-list": [{"title": "Snõõper", "primary-type": "EP", "ext:score": "100"}]
+def test_musicbrainz_accepts_ep_release_group() -> None:
+    session = QueueSession(
+        {"artists": [{"id": "artist-id", "name": "Snõõper", "score": 100}]},
+        {
+            "release-groups": [
+                {
+                    "title": "Snõõper",
+                    "primary-type": "EP",
+                    "secondary-types": [],
+                    "score": 100,
+                }
+            ]
         },
     )
 
     assert (
-        MusicBrainzClient("https://example.com").find_studio_album_release("Snõõper", "Snõõper")
+        MusicBrainzClient(
+            "https://example.com",
+            session=session,  # type: ignore[arg-type]
+        ).find_studio_album_release("Snõõper", "Snõõper")
         == "Snõõper"
     )
+
+
+def test_musicbrainz_timeout_returns_no_match() -> None:
+    class TimeoutSession(QueueSession):
+        def get(self, url, **kwargs):
+            raise requests.Timeout("unavailable")
+
+    client = MusicBrainzClient(
+        "https://example.com",
+        timeout=2,
+        session=TimeoutSession(),  # type: ignore[arg-type]
+    )
+
+    assert client.find_earliest_studio_album("Artist", "Title") == ""

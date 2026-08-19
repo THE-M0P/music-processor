@@ -35,7 +35,12 @@ class FakeAcoustID:
         return FingerprintResult()
 
 
-def make_processor(tmp_path: Path, *, dry_run: bool = False) -> MusicProcessor:
+def make_processor(
+    tmp_path: Path,
+    *,
+    dry_run: bool = False,
+    source_db: Path | None = None,
+) -> MusicProcessor:
     uploads = tmp_path / "uploads"
     uploads.mkdir()
     settings = Settings(
@@ -45,6 +50,7 @@ def make_processor(tmp_path: Path, *, dry_run: bool = False) -> MusicProcessor:
         lock_file=tmp_path / "processor.lock",
         acoustid_api_key=None,
         musicbrainz_contact="https://example.com",
+        source_db=source_db,
         stability_wait=0,
         dry_run=dry_run,
     )
@@ -218,6 +224,9 @@ def test_live_version_uses_studio_album_without_losing_live_title(
     assert musicbrainz.calls == [("Radiohead", "Creep")]
     assert written[0].title == "Creep (Live at Glastonbury 1997)"
     assert written[0].album == "Pablo Honey"
+    assert written[0].artist_source == "source+acoustid"
+    assert written[0].album_source == "musicbrainz"
+    assert written[0].title_source == "acoustid+source-version"
     assert (
         processor.settings.library
         / "Radiohead"
@@ -280,6 +289,8 @@ def test_decision_log_records_metadata_source(
     ]
     assert records[0]["metadata"]["match_source"] == "existing-tags"
     assert records[0]["metadata"]["album_artist"] == "Artist"
+    assert records[0]["metadata"]["artist_source"] == "existing-tags"
+    assert records[0]["metadata"]["album_source"] == "existing-tags"
 
 
 def test_long_album_upload_uses_title_artist_and_release_group(
@@ -372,12 +383,14 @@ def test_same_source_url_removes_repeat_instead_of_creating_collision(
     def tags_for(path: Path) -> Tags:
         return Tags(
             artist="Artist",
+            album_artist="Artist",
             album="Album",
             title="Title",
             source_url=source_url,
         )
 
     monkeypatch.setattr("music_processor.processor.read_tags", tags_for)
+    monkeypatch.setattr("music_processor.processor.acoustic_content_digest", lambda path: "same")
     monkeypatch.setattr(
         "music_processor.processor.write_tags",
         lambda path, tags: pytest.fail("duplicate must not be retagged"),
@@ -389,6 +402,116 @@ def test_same_source_url_removes_repeat_instead_of_creating_collision(
     assert summary.imported == 0
     assert not uploaded.exists()
     assert existing.read_bytes() == b"original"
+
+
+def test_same_source_with_improved_metadata_relocates_existing_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_db = tmp_path / "state" / "sources.db"
+    processor = make_processor(tmp_path, source_db=source_db)
+    uploaded = processor.settings.uploads / "Artist - Better Title.mp3"
+    uploaded.write_bytes(b"fresh")
+    existing = processor.settings.library / "Artist" / "Old Album" / "Old Title.mp3"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"old")
+    source_url = "https://youtu.be/video-id"
+    processor.source_registry.register(source_url, existing, "same")
+
+    def tags_for(path: Path) -> Tags:
+        if path == uploaded:
+            return Tags(
+                artist="Artist",
+                album="Better Album",
+                title="Better Title",
+                source_url=source_url,
+            )
+        return Tags(
+            artist="Artist",
+            album="Old Album",
+            title="Old Title",
+            source_url=source_url,
+        )
+
+    monkeypatch.setattr("music_processor.processor.read_tags", tags_for)
+    monkeypatch.setattr("music_processor.processor.acoustic_content_digest", lambda path: "same")
+    monkeypatch.setattr("music_processor.processor.write_tags", lambda path, tags: None)
+
+    summary = processor.process_pending()
+
+    destination = processor.settings.library / "Artist" / "Better Album" / "Better Title.mp3"
+    assert summary.sources_updated == 1
+    assert not existing.exists()
+    assert destination.read_bytes() == b"fresh"
+    record = processor.source_registry.lookup(source_url)
+    assert record is not None
+    assert record.path == destination
+
+
+def test_same_source_with_different_audio_is_retained_for_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = make_processor(tmp_path)
+    uploaded = processor.settings.uploads / "Artist - Title.mp3"
+    uploaded.write_bytes(b"new-audio")
+    existing = processor.settings.library / "Artist" / "Album" / "Title.mp3"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"old-audio")
+    source_url = "https://youtu.be/video-id"
+
+    monkeypatch.setattr(
+        "music_processor.processor.read_tags",
+        lambda path: Tags(
+            artist="Artist",
+            album="Album",
+            title="Title",
+            source_url=source_url,
+        ),
+    )
+    monkeypatch.setattr(
+        "music_processor.processor.acoustic_content_digest",
+        lambda path: "new" if path == uploaded else "old",
+    )
+    monkeypatch.setattr("music_processor.processor.write_tags", lambda path, tags: None)
+
+    summary = processor.process_pending()
+
+    assert summary.imported == 1
+    assert summary.duplicates_removed == 0
+    assert existing.read_bytes() == b"old-audio"
+    assert (existing.parent / "Title (2).mp3").read_bytes() == b"new-audio"
+
+
+def test_registry_path_outside_library_is_never_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_db = tmp_path / "state" / "sources.db"
+    processor = make_processor(tmp_path, source_db=source_db)
+    uploaded = processor.settings.uploads / "Artist - Title.mp3"
+    uploaded.write_bytes(b"new-audio")
+    outside = tmp_path / "outside.mp3"
+    outside.write_bytes(b"must-survive")
+    source_url = "https://youtu.be/video-id"
+    processor.source_registry.register(source_url, outside, "same")
+
+    monkeypatch.setattr(
+        "music_processor.processor.read_tags",
+        lambda path: Tags(
+            artist="Artist",
+            album="Album",
+            title="Title",
+            source_url=source_url,
+        ),
+    )
+    monkeypatch.setattr("music_processor.processor.write_tags", lambda path, tags: None)
+
+    summary = processor.process_pending()
+
+    assert summary.imported == 1
+    assert outside.read_bytes() == b"must-survive"
+    assert (processor.settings.library / "Artist" / "Album" / "Title.mp3").exists()
 
 
 def test_same_title_from_different_source_keeps_both_files(

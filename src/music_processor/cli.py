@@ -12,6 +12,7 @@ from music_processor.clients import AcoustIDClient, MusicBrainzClient
 from music_processor.config import Settings
 from music_processor.locking import AlreadyRunningError, single_instance
 from music_processor.processor import MusicProcessor
+from music_processor.quarantine import quarantine_inventory
 
 DEFAULT_CONTACT = "https://github.com/THE-M0P/music-processor"
 
@@ -67,6 +68,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--source-db",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "MUSIC_PROCESSOR_SOURCE_DB",
+                "/mnt/music/.processor/sources.db",
+            )
+        ),
+    )
+    parser.add_argument(
         "--fallback-album",
         default=os.environ.get("MUSIC_PROCESSOR_FALLBACK_ALBUM", "Singles & Miscellaneous"),
     )
@@ -76,6 +87,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         default=environment_flag("MUSIC_PROCESSOR_DRY_RUN"),
+    )
+    parser.add_argument(
+        "--report-quarantine",
+        action="store_true",
+        help="report quarantined file counts and sizes without processing uploads",
     )
     parser.add_argument(
         "--log-level",
@@ -99,11 +115,23 @@ def main(argv: list[str] | None = None) -> int:
         acoustid_api_key=os.environ.get("ACOUSTID_API_KEY") or None,
         musicbrainz_contact=args.musicbrainz_contact,
         decision_log=args.decision_log,
+        source_db=args.source_db,
         fallback_album=args.fallback_album,
         stability_wait=args.stability_wait,
         request_timeout=args.request_timeout,
         dry_run=args.dry_run,
     )
+    if args.report_quarantine:
+        inventory = quarantine_inventory(settings.quarantine)
+        if not inventory:
+            print("Quarantine is empty")
+            return 0
+        for entry in inventory:
+            print(
+                f"{entry.reason}: files={entry.files} bytes={entry.bytes} "
+                f"oldest={entry.oldest.date().isoformat()}"
+            )
+        return 0
     acoustid = (
         AcoustIDClient(settings.acoustid_api_key, timeout=settings.request_timeout)
         if settings.acoustid_api_key
@@ -111,7 +139,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     processor = MusicProcessor(
         settings,
-        musicbrainz=MusicBrainzClient(settings.musicbrainz_contact),
+        musicbrainz=MusicBrainzClient(
+            settings.musicbrainz_contact,
+            timeout=settings.request_timeout,
+        ),
         acoustid=acoustid,
     )
     try:
@@ -123,12 +154,13 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.getLogger(__name__).info(
         "Finished: discovered=%d imported=%d sidecars_removed=%d quarantined=%d "
-        "duplicates_removed=%d deferred=%d failed=%d",
+        "duplicates_removed=%d sources_updated=%d deferred=%d failed=%d",
         summary.discovered,
         summary.imported,
         summary.sidecars_removed,
         summary.quarantined,
         summary.duplicates_removed,
+        summary.sources_updated,
         summary.deferred,
         summary.failed,
     )

@@ -2,21 +2,18 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import re
-import subprocess
 import time
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
-import musicbrainzngs
 import requests
 
+from music_processor.fingerprint import calculate_fingerprint
 from music_processor.naming import artists_match, normalise_artist
-from music_processor.tags import audio_duration
 
 LOGGER = logging.getLogger(__name__)
 
@@ -53,32 +50,15 @@ class AcoustIDClient:
         expected_title: str = "",
     ) -> FingerprintResult:
         try:
-            command = ["fpcalc", "-json"]
-            duration = audio_duration(path)
-            if duration > 1:
-                command.extend(("-length", str(min(120, max(1, int(duration) - 1)))))
-            command.append(str(path))
-            completed = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if completed.returncode != 0:
-                LOGGER.warning("fpcalc failed for %s: %s", path.name, completed.stderr.strip())
-                return FingerprintResult()
-
-            fingerprint_data = json.loads(completed.stdout)
-            fingerprint = fingerprint_data.get("fingerprint", "")
-            if not fingerprint:
+            fingerprint_data = calculate_fingerprint(path)
+            if fingerprint_data is None:
                 return FingerprintResult()
 
             response = self._request(
                 {
                     "client": self.api_key,
-                    "duration": int(fingerprint_data.get("duration", 0)),
-                    "fingerprint": fingerprint,
+                    "duration": int(fingerprint_data.duration),
+                    "fingerprint": fingerprint_data.fingerprint,
                     "meta": "recordings releasegroups",
                 }
             )
@@ -90,9 +70,6 @@ class AcoustIDClient:
             )
             return FingerprintResult()
         except (
-            FileNotFoundError,
-            json.JSONDecodeError,
-            subprocess.SubprocessError,
             TypeError,
             ValueError,
         ) as error:
@@ -198,10 +175,19 @@ class AcoustIDClient:
 
 
 class MusicBrainzClient:
-    def __init__(self, contact: str) -> None:
-        logging.getLogger("musicbrainzngs").setLevel(logging.WARNING)
-        musicbrainzngs.set_useragent("music-upload-processor", "0.1.0", contact)
-        musicbrainzngs.set_rate_limit(1.0, 1)
+    def __init__(
+        self,
+        contact: str,
+        *,
+        timeout: float = 15.0,
+        session: requests.Session | None = None,
+    ) -> None:
+        self.timeout = timeout
+        self.session = session or requests.Session()
+        self.session.headers.update({"User-Agent": f"music-upload-processor/0.1.0 ({contact})"})
+        self.max_attempts = 1 if session is not None else 3
+        self.request_interval = 0.0 if session is not None else 1.0
+        self._last_request = 0.0
         self._artist_ids: dict[str, str] = {}
         self._album_cache: dict[tuple[str, str], str] = {}
         self._release_group_cache: dict[tuple[str, str], str] = {}
@@ -214,11 +200,12 @@ class MusicBrainzClient:
             artist_id = self._get_artist_id(artist)
             if not artist_id:
                 return ""
-            result = musicbrainzngs.search_recordings(
-                recording=title,
-                arid=artist_id,
-                limit=100,
-                strict=True,
+            result = self._request(
+                "recording",
+                {
+                    "query": f'recording:"{self._escape_query(title)}" AND arid:{artist_id}',
+                    "limit": 100,
+                },
             )
         except Exception as error:
             LOGGER.warning("MusicBrainz lookup failed for %s - %s: %s", artist, title, error)
@@ -226,13 +213,13 @@ class MusicBrainzClient:
 
         best_album = ""
         best_date = "9999"
-        for recording in result.get("recording-list", []):
-            for release in recording.get("release-list", []):
+        for recording in result.get("recordings", []):
+            for release in recording.get("releases", []):
                 release_group = release.get("release-group", {})
                 date = release.get("date", "9999") or "9999"
                 if (
-                    release_group.get("type") == "Album"
-                    and not release_group.get("secondary-type-list", [])
+                    release_group.get("primary-type") == "Album"
+                    and not release_group.get("secondary-types", [])
                     and release.get("status") == "Official"
                     and date < best_date
                 ):
@@ -250,11 +237,12 @@ class MusicBrainzClient:
             artist_id = self._get_artist_id(artist)
             if not artist_id:
                 return ""
-            result = musicbrainzngs.search_release_groups(
-                releasegroup=query,
-                arid=artist_id,
-                limit=10,
-                strict=True,
+            result = self._request(
+                "release-group",
+                {
+                    "query": (f'releasegroup:"{self._escape_query(query)}" AND arid:{artist_id}'),
+                    "limit": 10,
+                },
             )
         except Exception as error:
             LOGGER.warning("MusicBrainz album lookup failed for %s - %s: %s", artist, query, error)
@@ -263,11 +251,11 @@ class MusicBrainzClient:
         album = next(
             (
                 candidate.get("title", "")
-                for candidate in result.get("release-group-list", [])
-                if int(candidate.get("ext:score", "0")) >= 95
+                for candidate in result.get("release-groups", [])
+                if int(candidate.get("score", "0")) >= 95
                 and normalise_artist(candidate.get("title", "")) == normalise_artist(query)
-                and (candidate.get("primary-type") or candidate.get("type")) in {"Album", "EP"}
-                and not candidate.get("secondary-type-list", [])
+                and candidate.get("primary-type") in {"Album", "EP"}
+                and not candidate.get("secondary-types", [])
             ),
             "",
         )
@@ -278,12 +266,18 @@ class MusicBrainzClient:
         if artist in self._artist_ids:
             return self._artist_ids[artist]
         try:
-            result = musicbrainzngs.search_artists(artist=artist, limit=5, strict=True)
+            result = self._request(
+                "artist",
+                {
+                    "query": f'artist:"{self._escape_query(artist)}"',
+                    "limit": 5,
+                },
+            )
         except Exception as error:
             LOGGER.warning("MusicBrainz artist lookup failed for %s: %s", artist, error)
             return ""
 
-        artists = result.get("artist-list", [])
+        artists = result.get("artists", [])
         if not artists:
             return ""
         selected = next(
@@ -299,7 +293,7 @@ class MusicBrainzClient:
                 (
                     candidate
                     for candidate in artists
-                    if int(candidate.get("ext:score", "0")) >= 90
+                    if int(candidate.get("score", "0")) >= 90
                     and artists_match(artist, candidate.get("name", ""))
                 ),
                 None,
@@ -309,3 +303,31 @@ class MusicBrainzClient:
         artist_id = selected["id"]
         self._artist_ids[artist] = artist_id
         return artist_id
+
+    def _request(self, resource: str, params: dict[str, Any]) -> dict[str, Any]:
+        request_params = {**params, "fmt": "json"}
+        for attempt in range(1, self.max_attempts + 1):
+            delay = self.request_interval - (time.monotonic() - self._last_request)
+            if delay > 0:
+                time.sleep(delay)
+            self._last_request = time.monotonic()
+            try:
+                response = self.session.get(
+                    f"https://musicbrainz.org/ws/2/{resource}",
+                    params=request_params,
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise ValueError("MusicBrainz response was not an object")
+                return payload
+            except (requests.RequestException, ValueError):
+                if attempt == self.max_attempts:
+                    raise
+                time.sleep(0.5 * attempt)
+        raise RuntimeError("unreachable")
+
+    @staticmethod
+    def _escape_query(value: str) -> str:
+        return value.replace("\\", "\\\\").replace('"', '\\"')

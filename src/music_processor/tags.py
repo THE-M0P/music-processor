@@ -27,6 +27,10 @@ class Tags:
     release_group_id: str = ""
     acoustid_id: str = ""
     source_url: str = ""
+    artist_source: str = ""
+    album_artist_source: str = ""
+    album_source: str = ""
+    title_source: str = ""
 
 
 class TaggingError(RuntimeError):
@@ -69,6 +73,10 @@ def _read_id3_tags(path: Path) -> Tags:
         source_url=(
             _txxx_value(audio.tags, "Music Processor Source URL") or _txxx_value(audio.tags, "purl")
         ),
+        artist_source=_txxx_value(audio.tags, "Music Processor Artist Source"),
+        album_artist_source=_txxx_value(audio.tags, "Music Processor Album Artist Source"),
+        album_source=_txxx_value(audio.tags, "Music Processor Album Source"),
+        title_source=_txxx_value(audio.tags, "Music Processor Title Source"),
     )
 
 
@@ -120,6 +128,10 @@ def _write_id3_tags(path: Path, tags: Tags) -> None:
     _set_txxx(audio.tags, "MusicBrainz Release Group Id", tags.release_group_id)
     _set_txxx(audio.tags, "AcoustID Id", tags.acoustid_id)
     _set_txxx(audio.tags, "Music Processor Source URL", tags.source_url)
+    _set_txxx(audio.tags, "Music Processor Artist Source", tags.artist_source)
+    _set_txxx(audio.tags, "Music Processor Album Artist Source", tags.album_artist_source)
+    _set_txxx(audio.tags, "Music Processor Album Source", tags.album_source)
+    _set_txxx(audio.tags, "Music Processor Title Source", tags.title_source)
     audio.save()
 
 
