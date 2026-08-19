@@ -1,4 +1,6 @@
+import errno
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -24,6 +26,9 @@ class FakeMusicBrainz:
         self.release_calls.append((artist, title))
         return ""
 
+    def canonical_artist_name(self, artist: str) -> str:
+        return artist
+
 
 class FakeAcoustID:
     def fingerprint(
@@ -31,6 +36,7 @@ class FakeAcoustID:
         path: Path,
         expected_artist: str = "",
         expected_title: str = "",
+        alternate_artists: tuple[str, ...] = (),
     ) -> FingerprintResult:
         return FingerprintResult()
 
@@ -189,6 +195,7 @@ def test_live_version_uses_studio_album_without_losing_live_title(
             path: Path,
             expected_artist: str = "",
             expected_title: str = "",
+            alternate_artists: tuple[str, ...] = (),
         ) -> FingerprintResult:
             assert expected_artist == "Radiohead"
             assert expected_title == "Creep"
@@ -317,7 +324,7 @@ def test_long_album_upload_uses_title_artist_and_release_group(
 
     processor.process_pending()
 
-    assert musicbrainz.calls == [("TISM", "Hot Dogma (1990)")]
+    assert musicbrainz.calls == []
     assert musicbrainz.release_calls == [("TISM", "Hot Dogma (1990)")]
     assert written[0].artist == "TISM"
     assert written[0].album == "Hot Dogma"
@@ -334,9 +341,10 @@ def test_title_artist_replaces_uploader_for_fingerprinting(
             path: Path,
             expected_artist: str = "",
             expected_title: str = "",
+            alternate_artists: tuple[str, ...] = (),
         ) -> FingerprintResult:
-            assert expected_artist == "Snõõper"
-            assert expected_title == "INVENTORY"
+            assert expected_artist == "Harakiri Diat"
+            assert alternate_artists == ("Snõõper",)
             return FingerprintResult(
                 artist="Snõõper",
                 album_artist="Snõõper",
@@ -602,3 +610,203 @@ def test_chaptered_release_without_match_uses_release_title_as_album(
     assert written[0].album_artist == "Snõõper"
     assert written[0].album == "Halloween"
     assert (processor.settings.library / "Snõõper" / "Halloween" / "Halloween.mp3").exists()
+
+
+def test_three_part_song_title_keeps_existing_artist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = make_processor(tmp_path)
+    uploaded = processor.settings.uploads / "Pink Floyd - Another Brick in the Wall - Part 2.mp3"
+    uploaded.write_bytes(b"audio")
+    written: list[Tags] = []
+    monkeypatch.setattr(
+        "music_processor.processor.read_tags",
+        lambda path: Tags(
+            artist="Pink Floyd",
+            title="Pink Floyd - Another Brick in the Wall - Part 2",
+        ),
+    )
+    monkeypatch.setattr(
+        "music_processor.processor.write_tags",
+        lambda path, tags: written.append(tags),
+    )
+
+    processor.process_pending()
+
+    assert written[0].artist == "Pink Floyd"
+    assert written[0].title == "Another Brick in the Wall - Part 2"
+    assert written[0].artist_source == "existing-tags"
+    assert written[0].title_source == "existing-tags"
+
+
+def test_release_upload_uses_release_lookup_before_recording_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReleaseFirstMusicBrainz(FakeMusicBrainz):
+        def find_earliest_studio_album(self, artist: str, title: str) -> str:
+            pytest.fail("release uploads must use release-group lookup first")
+
+        def find_studio_album_release(self, artist: str, title: str) -> str:
+            self.release_calls.append((artist, title))
+            return "Actual Album"
+
+    processor = make_processor(tmp_path)
+    processor.musicbrainz = ReleaseFirstMusicBrainz()  # type: ignore[assignment]
+    uploaded = processor.settings.uploads / "Uploader - Artist - Actual Album.mp3"
+    uploaded.write_bytes(b"audio")
+    written: list[Tags] = []
+    monkeypatch.setattr(
+        "music_processor.processor.read_tags",
+        lambda path: Tags(artist="Uploader", title="Artist - Actual Album"),
+    )
+    monkeypatch.setattr("music_processor.processor.audio_duration", lambda path: 1800.0)
+    monkeypatch.setattr(
+        "music_processor.processor.write_tags",
+        lambda path, tags: written.append(tags),
+    )
+
+    processor.process_pending()
+
+    assert written[0].artist == "Artist"
+    assert written[0].album == "Actual Album"
+
+
+def test_ambiguous_filename_artist_requires_musicbrainz_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ConfirmingMusicBrainz(FakeMusicBrainz):
+        def find_earliest_studio_album(self, artist: str, title: str) -> str:
+            self.calls.append((artist, title))
+            return "Super Snooper"
+
+        def canonical_artist_name(self, artist: str) -> str:
+            return "Snõõper"
+
+    processor = make_processor(tmp_path)
+    musicbrainz = ConfirmingMusicBrainz()
+    processor.musicbrainz = musicbrainz  # type: ignore[assignment]
+    uploaded = (
+        processor.settings.uploads
+        / "Harakiri Diat - SNÕÕPER - INVENTORY (OFFICIAL MUSIC VIDEO).mp3"
+    )
+    uploaded.write_bytes(b"audio")
+    written: list[Tags] = []
+    monkeypatch.setattr(
+        "music_processor.processor.read_tags",
+        lambda path: Tags(
+            artist="Harakiri Diat",
+            title="SNÕÕPER - INVENTORY (OFFICIAL MUSIC VIDEO)",
+        ),
+    )
+    monkeypatch.setattr(
+        "music_processor.processor.write_tags",
+        lambda path, tags: written.append(tags),
+    )
+
+    processor.process_pending()
+
+    assert musicbrainz.calls == [("Snõõper", "INVENTORY")]
+    assert written[0].artist == "Snõõper"
+    assert written[0].album_artist == "Snõõper"
+    assert written[0].artist_source == "filename+musicbrainz"
+    assert written[0].album == "Super Snooper"
+    assert written[0].title == "INVENTORY"
+
+
+def test_musicbrainz_canonicalizes_filename_artist_spelling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CanonicalMusicBrainz(FakeMusicBrainz):
+        def canonical_artist_name(self, artist: str) -> str:
+            return "Snõõper"
+
+    processor = make_processor(tmp_path)
+    processor.musicbrainz = CanonicalMusicBrainz("Super Snooper")  # type: ignore[assignment]
+    uploaded = processor.settings.uploads / "SNOOPER - Xerox (Official video).mp3"
+    uploaded.write_bytes(b"audio")
+    written: list[Tags] = []
+    monkeypatch.setattr("music_processor.processor.read_tags", lambda path: Tags())
+    monkeypatch.setattr(
+        "music_processor.processor.write_tags",
+        lambda path, tags: written.append(tags),
+    )
+
+    processor.process_pending()
+
+    assert written[0].artist == "Snõõper"
+    assert written[0].album_artist == "Snõõper"
+    assert written[0].artist_source == "filename+musicbrainz"
+
+
+def test_cross_filesystem_replacement_is_staged_before_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "incoming.mp3"
+    destination = tmp_path / "library.mp3"
+    source.write_bytes(b"new-audio")
+    destination.write_bytes(b"old-audio")
+    real_replace = os.replace
+
+    def replace_with_cross_device_error(first, second) -> None:
+        if Path(first) == source:
+            raise OSError(errno.EXDEV, "cross-device link")
+        real_replace(first, second)
+
+    monkeypatch.setattr(os, "replace", replace_with_cross_device_error)
+
+    MusicProcessor._move_file(source, destination, replace=True)
+
+    assert destination.read_bytes() == b"new-audio"
+    assert not source.exists()
+
+
+def test_failed_cross_filesystem_copy_preserves_both_originals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "incoming.mp3"
+    destination = tmp_path / "library.mp3"
+    source.write_bytes(b"new-audio")
+    destination.write_bytes(b"old-audio")
+
+    def cross_device_error(first, second) -> None:
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    def copy_error(_source_file, _destination_file) -> None:
+        raise OSError("copy failed")
+
+    monkeypatch.setattr(os, "replace", cross_device_error)
+    monkeypatch.setattr("music_processor.processor.shutil.copyfileobj", copy_error)
+
+    with pytest.raises(OSError, match="copy failed"):
+        MusicProcessor._move_file(source, destination, replace=True)
+
+    assert source.read_bytes() == b"new-audio"
+    assert destination.read_bytes() == b"old-audio"
+
+
+def test_cross_filesystem_symlink_move_never_reads_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target.mp3"
+    target.write_bytes(b"must-not-be-copied")
+    source = tmp_path / "incoming-link.mp3"
+    source.symlink_to(target)
+    destination = tmp_path / "quarantined-link.mp3"
+
+    def cross_device_error(first, second) -> None:
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    monkeypatch.setattr(os, "rename", cross_device_error)
+
+    MusicProcessor._move_file(source, destination)
+
+    assert destination.is_symlink()
+    assert destination.readlink() == target
+    assert target.read_bytes() == b"must-not-be-copied"

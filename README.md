@@ -65,6 +65,12 @@ On Debian or Ubuntu:
 sudo apt install libchromaprint-tools python3-venv
 ```
 
+On Arch Linux:
+
+```console
+sudo pacman -S chromaprint python
+```
+
 ## Installation
 
 ```console

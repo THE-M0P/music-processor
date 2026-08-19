@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
+import os
 import re
 import shutil
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -22,6 +25,7 @@ from music_processor.naming import (
     clean_title,
     merge_version_title,
     normalise_artist_case,
+    normalise_filename_artist_case,
     prefer_filename_artist,
     preferred_artist_name,
     primary_artist,
@@ -43,6 +47,10 @@ from music_processor.tags import (
 LOGGER = logging.getLogger(__name__)
 SIDECAR_EXTENSIONS = {".webp", ".jpg", ".jpeg", ".png"}
 INCOMPLETE_EXTENSIONS = {".part", ".ytdl", ".tmp"}
+RELEASE_UPLOAD_PATTERN = re.compile(
+    r"\b(?:full|complete)\s+(?:album|ep)\b|\balbum\s+stream\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -65,6 +73,8 @@ class ResolutionContext:
     source_title: str
     guessed_artist: str
     guessed_title: str
+    filename_artist: str
+    filename_title: str
     release_title: str
     chapter_count: int
     is_release_upload: bool
@@ -173,11 +183,17 @@ class MusicProcessor:
             artist,
             current.title,
         )
+        filename_artist, filename_title = split_upload_filename(path.stem)
+        filename_artist = normalise_filename_artist_case(filename_artist)
+        filename_title = clean_title(filename_title, filename_artist)
         release_title = release_lookup_title(guessed_title, guessed_artist)
         duration = audio_duration(path)
         chapter_count = audio_chapter_count(path)
         is_release_upload = (
-            duration >= 20 * 60 or chapter_count > 1 or release_title != guessed_title
+            duration >= 20 * 60
+            or chapter_count > 1
+            or release_title != guessed_title
+            or bool(RELEASE_UPLOAD_PATTERN.search(source_title))
         )
         return ResolutionContext(
             current=current,
@@ -186,6 +202,8 @@ class MusicProcessor:
             source_title=source_title,
             guessed_artist=guessed_artist,
             guessed_title=guessed_title,
+            filename_artist=filename_artist,
+            filename_title=filename_title,
             release_title=release_title,
             chapter_count=chapter_count,
             is_release_upload=is_release_upload,
@@ -200,7 +218,18 @@ class MusicProcessor:
             LOGGER.info("Skipping single-recording fingerprint for release upload %s", path.name)
             fingerprint = FingerprintResult()
         else:
-            fingerprint = self._fingerprint(path, context.artist, cleaned_source_title)
+            alternate_artists = (
+                (context.filename_artist,)
+                if context.filename_artist
+                and not artists_match(context.artist, context.filename_artist)
+                else ()
+            )
+            fingerprint = self._fingerprint(
+                path,
+                context.artist,
+                cleaned_source_title,
+                alternate_artists,
+            )
         if fingerprint.artist or fingerprint.title:
             return self._fingerprint_tags(context, fingerprint, cleaned_source_title)
         return self._filename_tags(context)
@@ -251,6 +280,18 @@ class MusicProcessor:
             canonical_song_title(final_title),
         )
         album_source = "musicbrainz" if album else ""
+        artist_source = "source+acoustid" if context.artist else "acoustid"
+        if album:
+            canonical_artist = self._canonical_artist(final_album_artist)
+            original_artist = final_artist
+            original_album_artist = final_album_artist
+            if artists_match(final_artist, final_album_artist):
+                final_artist = preferred_artist_name(final_artist, canonical_artist)
+            final_album_artist = canonical_artist
+            if final_artist != original_artist:
+                artist_source += "+musicbrainz"
+            if final_album_artist != original_album_artist:
+                album_artist_source += "+musicbrainz"
         if not album and fingerprint.album:
             album = fingerprint.album
             album_source = "acoustid-release"
@@ -266,7 +307,7 @@ class MusicProcessor:
             release_group_id=fingerprint.release_group_id,
             acoustid_id=fingerprint.acoustid_id,
             source_url=context.current.source_url,
-            artist_source="source+acoustid" if context.artist else "acoustid",
+            artist_source=artist_source,
             album_artist_source=album_artist_source,
             album_source=album_source,
             title_source=("acoustid+source-version" if fingerprint.title else "source-title"),
@@ -275,22 +316,83 @@ class MusicProcessor:
     def _filename_tags(self, context: ResolutionContext) -> Tags | None:
         if not context.guessed_artist and not context.guessed_title:
             return None
+        alternate = self._alternate_filename_tags(context)
+        if alternate is not None:
+            return alternate
         lookup_artist = context.album_artist or primary_artist(context.guessed_artist)
         guessed_album, album_source = self._filename_album(context, lookup_artist)
+        final_artist = context.guessed_artist
+        final_album_artist = lookup_artist or final_artist
+        artist_source = (
+            "existing-tags"
+            if context.current.artist
+            and artists_match(context.guessed_artist, context.current.artist)
+            else "filename"
+        )
+        if album_source.startswith("musicbrainz"):
+            canonical_artist = self._canonical_artist(final_album_artist)
+            original_artist = final_artist
+            if artists_match(final_artist, final_album_artist):
+                final_artist = preferred_artist_name(final_artist, canonical_artist)
+            final_album_artist = canonical_artist
+            if final_artist != original_artist:
+                artist_source += "+musicbrainz"
         return Tags(
-            artist=context.guessed_artist,
-            album_artist=lookup_artist or context.guessed_artist,
+            artist=final_artist,
+            album_artist=final_album_artist,
             album=guessed_album,
             title=context.guessed_title,
             source_title=context.source_title,
             match_source="filename",
             confidence=0.25,
             source_url=context.current.source_url,
-            artist_source="filename",
+            artist_source=artist_source,
+            album_artist_source=(
+                "existing-tags" if context.current.album_artist else "derived-artist"
+            ),
+            album_source=album_source,
+            title_source="existing-tags" if context.current.title else "filename",
+        )
+
+    def _alternate_filename_tags(self, context: ResolutionContext) -> Tags | None:
+        artist = context.filename_artist
+        title = context.filename_title
+        if not artist or not title or artists_match(artist, context.guessed_artist):
+            return None
+        if context.is_release_upload:
+            release_title = release_lookup_title(title, artist)
+            album = self.musicbrainz.find_studio_album_release(artist, release_title)
+            album_source = "musicbrainz-release"
+        else:
+            release_title = title
+            album = self.musicbrainz.find_earliest_studio_album(
+                artist,
+                canonical_song_title(title),
+            )
+            album_source = "musicbrainz"
+        if not album:
+            return None
+        if release_title != title and artists_match(album, artist):
+            album = clean_album(release_title)
+        artist = self._canonical_artist(artist)
+        return Tags(
+            artist=artist,
+            album_artist=primary_artist(artist),
+            album=album,
+            title=title,
+            source_title=context.source_title,
+            match_source="filename",
+            confidence=0.5,
+            source_url=context.current.source_url,
+            artist_source=f"filename+{album_source}",
             album_artist_source="derived-artist",
             album_source=album_source,
             title_source="filename",
         )
+
+    def _canonical_artist(self, artist: str) -> str:
+        canonical = self.musicbrainz.canonical_artist_name(artist)
+        return preferred_artist_name(artist, canonical) if canonical else artist
 
     def _filename_album(
         self,
@@ -300,13 +402,7 @@ class MusicProcessor:
         guessed_album = ""
         album_source = ""
         if lookup_artist and context.guessed_title:
-            guessed_album = self.musicbrainz.find_earliest_studio_album(
-                lookup_artist,
-                canonical_song_title(context.guessed_title),
-            )
-            if guessed_album:
-                album_source = "musicbrainz"
-            if not guessed_album and context.is_release_upload:
+            if context.is_release_upload:
                 guessed_album = self.musicbrainz.find_studio_album_release(
                     lookup_artist,
                     context.release_title,
@@ -321,9 +417,22 @@ class MusicProcessor:
             if not guessed_album and context.chapter_count > 1:
                 guessed_album = clean_album(context.guessed_title)
                 album_source = "filename-release"
+            if not guessed_album:
+                guessed_album = self.musicbrainz.find_earliest_studio_album(
+                    lookup_artist,
+                    canonical_song_title(context.guessed_title),
+                )
+                if guessed_album:
+                    album_source = "musicbrainz"
         return guessed_album, album_source
 
-    def _fingerprint(self, path: Path, artist: str, title: str) -> FingerprintResult:
+    def _fingerprint(
+        self,
+        path: Path,
+        artist: str,
+        title: str,
+        alternate_artists: tuple[str, ...] = (),
+    ) -> FingerprintResult:
         if self.acoustid is None:
             LOGGER.info("Skipping AcoustID lookup because ACOUSTID_API_KEY is not set")
             return FingerprintResult()
@@ -331,6 +440,7 @@ class MusicProcessor:
             path,
             expected_artist=artist,
             expected_title=canonical_song_title(title),
+            alternate_artists=alternate_artists,
         )
 
     def _finish_import(
@@ -446,7 +556,7 @@ class MusicProcessor:
             return
 
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(path), destination)
+        self._move_file(path, destination)
         if register_source and final_tags.source_url:
             self.source_registry.register(final_tags.source_url, destination, content_digest)
         try:
@@ -522,7 +632,7 @@ class MusicProcessor:
             return
 
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(path), destination)
+        self._move_file(path, destination, replace=destination == existing)
         if existing != destination:
             existing.unlink()
         self.source_registry.register(tags.source_url, destination, content_digest)
@@ -571,7 +681,7 @@ class MusicProcessor:
             LOGGER.info("Dry run: would quarantine %s as %s", path, destination)
             return
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(path), destination)
+        self._move_file(path, destination)
         LOGGER.warning("Quarantined %s as %s", path.name, destination)
 
     def _record_decision(
@@ -617,6 +727,60 @@ class MusicProcessor:
             if not candidate.exists():
                 return candidate
             counter += 1
+
+    @staticmethod
+    def _move_file(source: Path, destination: Path, *, replace: bool = False) -> None:
+        operation = os.replace if replace else os.rename
+        try:
+            operation(source, destination)
+            return
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+
+        if source.is_symlink():
+            link_target = os.readlink(source)
+            if replace:
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{destination.name}.",
+                    suffix=".tmp",
+                    dir=destination.parent,
+                )
+                os.close(descriptor)
+                temporary = Path(temporary_name)
+                temporary.unlink()
+                try:
+                    os.symlink(link_target, temporary)
+                    os.replace(temporary, destination)
+                except BaseException:
+                    temporary.unlink(missing_ok=True)
+                    raise
+            else:
+                os.symlink(link_target, destination)
+            source.unlink()
+            return
+
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as output, source.open("rb") as input_file:
+                shutil.copyfileobj(input_file, output)
+                output.flush()
+                os.fsync(output.fileno())
+            shutil.copystat(source, temporary)
+            if replace:
+                os.replace(temporary, destination)
+            else:
+                os.link(temporary, destination)
+                temporary.unlink()
+            source.unlink()
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
 
     def _is_stable(self, path: Path) -> bool:
         try:

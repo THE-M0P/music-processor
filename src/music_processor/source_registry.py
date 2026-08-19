@@ -84,8 +84,8 @@ class SourceRegistry:
         source_key = source_identity_key(source_url)
         if not source_key or self.path is None:
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             with closing(sqlite3.connect(self.path)) as database:
                 self._create_schema(database)
                 database.execute(

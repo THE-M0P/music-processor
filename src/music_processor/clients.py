@@ -12,8 +12,9 @@ from typing import Any
 
 import requests
 
+from music_processor import __version__
 from music_processor.fingerprint import calculate_fingerprint
-from music_processor.naming import artists_match, normalise_artist
+from music_processor.naming import artists_match, canonical_song_title, normalise_artist
 
 LOGGER = logging.getLogger(__name__)
 
@@ -42,12 +43,15 @@ class AcoustIDClient:
         self.timeout = timeout
         self.session = session or requests.Session()
         self.max_attempts = 1 if session is not None else 3
+        self.request_interval = 0.0 if session is not None else 0.34
+        self._last_request = 0.0
 
     def fingerprint(
         self,
         path: Path,
         expected_artist: str = "",
         expected_title: str = "",
+        alternate_artists: tuple[str, ...] = (),
     ) -> FingerprintResult:
         try:
             fingerprint_data = calculate_fingerprint(path)
@@ -62,8 +66,12 @@ class AcoustIDClient:
                     "meta": "recordings releasegroups",
                 }
             )
-            response.raise_for_status()
-            return self._select_recording(response.json(), expected_artist, expected_title)
+            return self._select_recording(
+                response.json(),
+                expected_artist,
+                expected_title,
+                alternate_artists,
+            )
         except requests.RequestException as error:
             LOGGER.warning(
                 "AcoustID HTTP request failed for %s (%s)", path.name, type(error).__name__
@@ -78,12 +86,18 @@ class AcoustIDClient:
 
     def _request(self, params: dict[str, Any]) -> requests.Response:
         for attempt in range(1, self.max_attempts + 1):
+            delay = self.request_interval - (time.monotonic() - self._last_request)
+            if delay > 0:
+                time.sleep(delay)
+            self._last_request = time.monotonic()
             try:
-                return self.session.get(
+                response = self.session.post(
                     "https://api.acoustid.org/v2/lookup",
-                    params=params,
+                    data=params,
                     timeout=self.timeout,
                 )
+                response.raise_for_status()
+                return response
             except requests.RequestException:
                 if attempt == self.max_attempts:
                     raise
@@ -95,61 +109,117 @@ class AcoustIDClient:
         payload: dict[str, Any],
         expected_artist: str,
         expected_title: str = "",
+        alternate_artists: tuple[str, ...] = (),
     ) -> FingerprintResult:
         if payload.get("status") != "ok":
             return FingerprintResult()
 
+        expected_artists = tuple(
+            artist for artist in (expected_artist, *alternate_artists) if artist
+        )
         candidates: list[tuple[float, FingerprintResult]] = []
         for result in payload.get("results", []):
-            score = float(result.get("score", 0))
+            score = _float_score(result.get("score"))
             if score < 0.5:
                 continue
             for recording in result.get("recordings", []):
-                artists = [
-                    artist.get("name", "").strip()
-                    for artist in recording.get("artists", [])
-                    if artist.get("name", "").strip()
-                ]
-                artist_credit = AcoustIDClient._artist_credit(recording, artists)
-                artist_candidates = {
-                    artist_credit,
-                    ", ".join(artists),
-                    " & ".join(artists),
-                    *artists,
-                }
-                if expected_artist and not any(
-                    artists_match(expected_artist, candidate)
-                    for candidate in artist_candidates
-                    if candidate
-                ):
-                    continue
-
-                album = ""
-                release_group_id = ""
-                for release_group in recording.get("releasegroups", []):
-                    if release_group.get("type") == "Album" and not release_group.get(
-                        "secondarytypes", []
-                    ):
-                        album = release_group.get("title", "")
-                        release_group_id = release_group.get("id", "")
-                        break
-                title = recording.get("title", "")
-                title_similarity = AcoustIDClient._title_similarity(expected_title, title)
-                candidate = FingerprintResult(
-                    artist=artist_credit or (artists[0] if artists else ""),
-                    album_artist=artists[0] if artists else "",
-                    title=title,
-                    album=album,
-                    recording_id=recording.get("id", ""),
-                    release_group_id=release_group_id,
-                    acoustid_id=result.get("id", ""),
-                    score=score,
+                selected = AcoustIDClient._candidate(
+                    result,
+                    recording,
+                    score,
+                    expected_artists,
+                    expected_title,
                 )
-                candidates.append((score + title_similarity * 0.15, candidate))
+                if selected is not None:
+                    candidates.append(selected)
 
         if not candidates:
             return FingerprintResult()
         return max(candidates, key=lambda item: item[0])[1]
+
+    @staticmethod
+    def _candidate(
+        result: dict[str, Any],
+        recording: dict[str, Any],
+        score: float,
+        expected_artists: tuple[str, ...],
+        expected_title: str,
+    ) -> tuple[float, FingerprintResult] | None:
+        artists = AcoustIDClient._artist_names(recording)
+        artist_credit = AcoustIDClient._artist_credit(recording, artists)
+        if not AcoustIDClient._artists_acceptable(
+            expected_artists,
+            artists,
+            artist_credit,
+        ):
+            return None
+
+        title = _text(recording.get("title"))
+        title_similarity = AcoustIDClient._title_similarity(expected_title, title)
+        if not AcoustIDClient._title_acceptable(
+            expected_artists,
+            expected_title,
+            title_similarity,
+            score,
+        ):
+            return None
+
+        album, release_group_id = AcoustIDClient._studio_release_group(recording)
+        candidate = FingerprintResult(
+            artist=artist_credit or (artists[0] if artists else ""),
+            album_artist=artists[0] if artists else "",
+            title=title,
+            album=album,
+            recording_id=_text(recording.get("id")),
+            release_group_id=release_group_id,
+            acoustid_id=_text(result.get("id")),
+            score=score,
+        )
+        return score + title_similarity * 0.15, candidate
+
+    @staticmethod
+    def _artist_names(recording: dict[str, Any]) -> list[str]:
+        return [
+            name
+            for artist in recording.get("artists", [])
+            if (name := _text(artist.get("name")).strip())
+        ]
+
+    @staticmethod
+    def _artists_acceptable(
+        expected_artists: tuple[str, ...],
+        artists: list[str],
+        artist_credit: str,
+    ) -> bool:
+        if not expected_artists:
+            return True
+        candidates = {artist_credit, ", ".join(artists), " & ".join(artists), *artists}
+        return any(
+            artists_match(expected, candidate)
+            for expected in expected_artists
+            for candidate in candidates
+            if candidate
+        )
+
+    @staticmethod
+    def _title_acceptable(
+        expected_artists: tuple[str, ...],
+        expected_title: str,
+        title_similarity: float,
+        score: float,
+    ) -> bool:
+        if expected_artists:
+            return True
+        if expected_title:
+            return title_similarity >= 0.65
+        return score >= 0.9
+
+    @staticmethod
+    def _studio_release_group(recording: dict[str, Any]) -> tuple[str, str]:
+        for release_group in recording.get("releasegroups", []):
+            if release_group.get("type") == "Album" and not release_group.get("secondarytypes", []):
+                return _text(release_group.get("title")), _text(release_group.get("id"))
+        return "", ""
 
     @staticmethod
     def _artist_credit(recording: dict[str, Any], artists: list[str]) -> str:
@@ -184,13 +254,21 @@ class MusicBrainzClient:
     ) -> None:
         self.timeout = timeout
         self.session = session or requests.Session()
-        self.session.headers.update({"User-Agent": f"music-upload-processor/0.1.0 ({contact})"})
+        self.session.headers.update(
+            {"User-Agent": f"music-upload-processor/{__version__} ({contact})"}
+        )
         self.max_attempts = 1 if session is not None else 3
         self.request_interval = 0.0 if session is not None else 1.0
         self._last_request = 0.0
         self._artist_ids: dict[str, str] = {}
+        self._artist_names: dict[str, str] = {}
         self._album_cache: dict[tuple[str, str], str] = {}
         self._release_group_cache: dict[tuple[str, str], str] = {}
+
+    def canonical_artist_name(self, artist: str) -> str:
+        if not self._get_artist_id(artist):
+            return ""
+        return self._artist_names.get(artist, "")
 
     def find_earliest_studio_album(self, artist: str, title: str) -> str:
         cache_key = (normalise_artist(artist), normalise_artist(title))
@@ -207,13 +285,19 @@ class MusicBrainzClient:
                     "limit": 100,
                 },
             )
-        except Exception as error:
+        except (requests.RequestException, TypeError, ValueError) as error:
             LOGGER.warning("MusicBrainz lookup failed for %s - %s: %s", artist, title, error)
             return ""
 
         best_album = ""
         best_date = "9999"
+        expected_title = normalise_artist(canonical_song_title(title))
         for recording in result.get("recordings", []):
+            candidate_title = normalise_artist(
+                canonical_song_title(str(recording.get("title", "")))
+            )
+            if _integer_score(recording.get("score")) < 90 or candidate_title != expected_title:
+                continue
             for release in recording.get("releases", []):
                 release_group = release.get("release-group", {})
                 date = release.get("date", "9999") or "9999"
@@ -244,7 +328,7 @@ class MusicBrainzClient:
                     "limit": 10,
                 },
             )
-        except Exception as error:
+        except (requests.RequestException, TypeError, ValueError) as error:
             LOGGER.warning("MusicBrainz album lookup failed for %s - %s: %s", artist, query, error)
             return ""
 
@@ -252,7 +336,7 @@ class MusicBrainzClient:
             (
                 candidate.get("title", "")
                 for candidate in result.get("release-groups", [])
-                if int(candidate.get("score", "0")) >= 95
+                if _integer_score(candidate.get("score")) >= 95
                 and normalise_artist(candidate.get("title", "")) == normalise_artist(query)
                 and candidate.get("primary-type") in {"Album", "EP"}
                 and not candidate.get("secondary-types", [])
@@ -273,7 +357,7 @@ class MusicBrainzClient:
                     "limit": 5,
                 },
             )
-        except Exception as error:
+        except (requests.RequestException, TypeError, ValueError) as error:
             LOGGER.warning("MusicBrainz artist lookup failed for %s: %s", artist, error)
             return ""
 
@@ -293,15 +377,18 @@ class MusicBrainzClient:
                 (
                     candidate
                     for candidate in artists
-                    if int(candidate.get("score", "0")) >= 90
+                    if _integer_score(candidate.get("score")) >= 90
                     and artists_match(artist, candidate.get("name", ""))
                 ),
                 None,
             )
         if selected is None:
             return ""
-        artist_id = selected["id"]
+        artist_id = _text(selected.get("id"))
+        if not artist_id:
+            return ""
         self._artist_ids[artist] = artist_id
+        self._artist_names[artist] = _text(selected.get("name"))
         return artist_id
 
     def _request(self, resource: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -331,3 +418,21 @@ class MusicBrainzClient:
     @staticmethod
     def _escape_query(value: str) -> str:
         return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _integer_score(value: object) -> int:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _float_score(value: object) -> float:
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _text(value: object) -> str:
+    return value if isinstance(value, str) else ""

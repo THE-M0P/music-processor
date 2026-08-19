@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -15,6 +16,34 @@ from music_processor.processor import MusicProcessor
 from music_processor.quarantine import quarantine_inventory
 
 DEFAULT_CONTACT = "https://github.com/THE-M0P/music-processor"
+
+
+def non_negative_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be a finite number greater than or equal to zero")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a finite number greater than zero")
+    return parsed
+
+
+def valid_fallback_album(value: str) -> str:
+    value = value.strip()
+    if not value or value in {".", ".."}:
+        raise argparse.ArgumentTypeError("must be a usable directory name")
+    return value
+
+
+def valid_log_level(value: str) -> str:
+    value = value.upper()
+    if value not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
+        raise argparse.ArgumentTypeError("must be DEBUG, INFO, WARNING, or ERROR")
+    return value
 
 
 def default_lock_file() -> Path:
@@ -79,10 +108,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fallback-album",
+        type=valid_fallback_album,
         default=os.environ.get("MUSIC_PROCESSOR_FALLBACK_ALBUM", "Singles & Miscellaneous"),
     )
-    parser.add_argument("--stability-wait", type=float, default=2.0)
-    parser.add_argument("--request-timeout", type=float, default=15.0)
+    parser.add_argument("--stability-wait", type=non_negative_float, default=2.0)
+    parser.add_argument("--request-timeout", type=positive_float, default=15.0)
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -95,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--log-level",
+        type=valid_log_level,
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         default=os.environ.get("MUSIC_PROCESSOR_LOG_LEVEL", "INFO"),
     )

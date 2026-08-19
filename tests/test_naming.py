@@ -86,13 +86,13 @@ def test_official_channel_name_is_cleaned() -> None:
     )
 
 
-def test_embedded_title_artist_wins_over_unrelated_uploader_tag() -> None:
+def test_ambiguous_filename_does_not_override_tag_without_external_evidence() -> None:
     assert (
         prefer_filename_artist(
             "Harakiri Diat - SNÕÕPER - INVENTORY (OFFICIAL MUSIC VIDEO)",
             "Harakiri Diat",
         )
-        == "Snõõper"
+        == "Harakiri Diat"
     )
 
 
@@ -129,3 +129,38 @@ def test_safe_name_obeys_utf8_component_budget() -> None:
 
     assert len(name.encode("utf-8")) <= 180
     assert name
+
+
+def test_three_part_song_title_does_not_replace_tagged_artist() -> None:
+    assert (
+        prefer_filename_artist(
+            "Pink Floyd - Another Brick in the Wall - Part 2",
+            "Pink Floyd",
+        )
+        == "Pink Floyd"
+    )
+
+
+def test_three_part_tyler_title_does_not_replace_artist() -> None:
+    assert (
+        prefer_filename_artist(
+            "Tyler, The Creator - GONE, GONE - THANK YOU",
+            "Tyler, The Creator",
+        )
+        == "Tyler, The Creator"
+    )
+
+
+def test_non_latin_artists_can_match() -> None:
+    assert artists_match("宇多田ヒカル", "宇多田ヒカル")
+    assert artists_match("Пикник", "ПИКНИК")
+    assert not artists_match("蔡依林", "周杰倫")
+
+
+def test_safe_name_rejects_dot_fallback_and_null_characters() -> None:
+    assert safe_name(None, "..") == "unnamed"
+    assert "\0" not in safe_name("bad\0name", "fallback")
+
+
+def test_full_album_marker_is_removed_from_display_title() -> None:
+    assert clean_title("Album Name (Full Album)") == "Album Name"

@@ -1,6 +1,8 @@
 import os
 
-from music_processor.cli import default_lock_file, environment_flag, main
+import pytest
+
+from music_processor.cli import build_parser, default_lock_file, environment_flag, main
 
 
 def test_environment_flag(monkeypatch) -> None:
@@ -27,3 +29,25 @@ def test_quarantine_report_does_not_require_upload_directory(tmp_path, capsys) -
     assert main(["--quarantine", str(tmp_path / "failed"), "--report-quarantine"]) == 0
     output = capsys.readouterr().out
     assert "tagging-error: files=1 bytes=6" in output
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ["--stability-wait", "-1"],
+        ["--request-timeout", "0"],
+        ["--request-timeout", "nan"],
+        ["--fallback-album", ".."],
+        ["--fallback-album", ""],
+    ),
+)
+def test_invalid_operational_values_are_rejected(arguments) -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(arguments)
+
+
+def test_invalid_environment_log_level_is_rejected(monkeypatch) -> None:
+    monkeypatch.setenv("MUSIC_PROCESSOR_LOG_LEVEL", "verbose")
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([])

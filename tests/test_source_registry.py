@@ -57,3 +57,13 @@ def test_corrupt_registry_does_not_block_processing_state(tmp_path: Path) -> Non
     registry.register("https://youtu.be/video-id", tmp_path / "song.mp3", "digest")
 
     assert database.read_bytes() == b"not sqlite"
+
+
+def test_uncreatable_registry_parent_does_not_block_import_state(tmp_path: Path) -> None:
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("blocked", encoding="utf-8")
+    registry = SourceRegistry(blocker / "sources.db")
+
+    registry.register("https://youtu.be/video-id", tmp_path / "song.mp3", "digest")
+
+    assert blocker.read_text(encoding="utf-8") == "blocked"

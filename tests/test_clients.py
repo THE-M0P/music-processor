@@ -23,9 +23,14 @@ class QueueSession:
         self.payloads = list(payloads)
         self.headers: dict[str, str] = {}
         self.calls = []
+        self.post_calls = []
 
     def get(self, url, **kwargs):
         self.calls.append((url, kwargs))
+        return FakeResponse(self.payloads.pop(0))
+
+    def post(self, url, **kwargs):
+        self.post_calls.append((url, kwargs))
         return FakeResponse(self.payloads.pop(0))
 
 
@@ -142,12 +147,32 @@ def test_acoustid_does_not_match_tyler_the_creator_to_tyler() -> None:
     assert AcoustIDClient._select_recording(payload, "Tyler, The Creator") == FingerprintResult()
 
 
+def test_acoustid_rejects_unrelated_title_without_artist_evidence() -> None:
+    payload = {
+        "status": "ok",
+        "results": [
+            {
+                "score": 0.95,
+                "recordings": [
+                    {
+                        "title": "Completely Different Song",
+                        "artists": [{"name": "Unknown Artist"}],
+                        "releasegroups": [],
+                    }
+                ],
+            }
+        ],
+    }
+
+    assert AcoustIDClient._select_recording(payload, "", "Expected Title") == FingerprintResult()
+
+
 def test_acoustid_request_error_does_not_log_api_key(monkeypatch, caplog, tmp_path: Path) -> None:
     secret = "not-a-real-secret"
     fingerprint = "not-a-real-fingerprint"
 
     class FailingSession:
-        def get(self, *args, **kwargs):
+        def post(self, *args, **kwargs):
             raise requests.Timeout(f"request failed with client={secret}&fingerprint={fingerprint}")
 
     monkeypatch.setattr(
@@ -164,12 +189,32 @@ def test_acoustid_request_error_does_not_log_api_key(monkeypatch, caplog, tmp_pa
     assert fingerprint not in caplog.text
 
 
+def test_acoustid_uses_post_for_long_fingerprint(monkeypatch, tmp_path: Path) -> None:
+    session = QueueSession({"status": "ok", "results": []})
+    monkeypatch.setattr(
+        "music_processor.clients.calculate_fingerprint",
+        lambda path: FingerprintData(duration=180, fingerprint="fingerprint-data"),
+    )
+
+    result = AcoustIDClient("application-key", session=session).fingerprint(
+        tmp_path / "sample.mp3",
+        expected_artist="Artist",
+        expected_title="Title",
+    )
+
+    assert result == FingerprintResult()
+    assert not session.calls
+    assert session.post_calls[0][1]["data"]["fingerprint"] == "fingerprint-data"
+
+
 def test_musicbrainz_searches_enough_recordings_to_find_studio_album() -> None:
     session = QueueSession(
         {"artists": [{"id": "artist-id", "name": "Pearl Jam", "score": 100}]},
         {
             "recordings": [
                 {
+                    "title": "Alive",
+                    "score": 100,
                     "releases": [
                         {
                             "title": "Bootleg",
@@ -189,7 +234,7 @@ def test_musicbrainz_searches_enough_recordings_to_find_studio_album() -> None:
                                 "secondary-types": [],
                             },
                         },
-                    ]
+                    ],
                 }
             ]
         },
@@ -200,6 +245,62 @@ def test_musicbrainz_searches_enough_recordings_to_find_studio_album() -> None:
     assert session.calls[1][1]["params"]["limit"] == 100
     assert session.calls[1][1]["timeout"] == 15.0
     assert session.headers["User-Agent"].startswith("music-upload-processor/0.1.0")
+
+
+def test_musicbrainz_retains_canonical_artist_spelling() -> None:
+    session = QueueSession(
+        {"artists": [{"id": "artist-id", "name": "Snõõper", "score": 100}]},
+        {"recordings": []},
+    )
+    client = MusicBrainzClient("https://example.com", session=session)  # type: ignore[arg-type]
+
+    client.find_earliest_studio_album("Snooper", "Unknown")
+
+    assert client.canonical_artist_name("Snooper") == "Snõõper"
+
+
+def test_musicbrainz_ignores_fuzzy_recording_with_wrong_title() -> None:
+    session = QueueSession(
+        {"artists": [{"id": "artist-id", "name": "Artist", "score": 100}]},
+        {
+            "recordings": [
+                {
+                    "title": "Wrong Song",
+                    "score": 100,
+                    "releases": [
+                        {
+                            "title": "Wrong Album",
+                            "status": "Official",
+                            "date": "1980",
+                            "release-group": {
+                                "primary-type": "Album",
+                                "secondary-types": [],
+                            },
+                        }
+                    ],
+                },
+                {
+                    "title": "Right Song",
+                    "score": 98,
+                    "releases": [
+                        {
+                            "title": "Right Album",
+                            "status": "Official",
+                            "date": "2000",
+                            "release-group": {
+                                "primary-type": "Album",
+                                "secondary-types": [],
+                            },
+                        }
+                    ],
+                },
+            ]
+        },
+    )
+
+    client = MusicBrainzClient("https://example.com", session=session)  # type: ignore[arg-type]
+
+    assert client.find_earliest_studio_album("Artist", "Right Song") == "Right Album"
 
 
 def test_musicbrainz_recognises_long_form_album_title() -> None:

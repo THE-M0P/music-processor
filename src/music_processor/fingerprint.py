@@ -28,10 +28,11 @@ def calculate_fingerprint(
 ) -> FingerprintData | None:
     duration = audio_duration(path)
     command = ["fpcalc", "-json"]
-    if duration > 1:
+    if maximum_length is None:
+        command.extend(("-length", "0"))
+    elif duration > 1:
         length = max(1, int(duration) - 1)
-        if maximum_length is not None:
-            length = min(maximum_length, length)
+        length = min(maximum_length, length)
         command.extend(("-length", str(length)))
     command.append(str(path))
 

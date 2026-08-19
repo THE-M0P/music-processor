@@ -34,7 +34,7 @@ _TITLE_NOISE_EXPRESSIONS = (
     r"\s*[\(\[]\s*(?:official\s+)?lyric(?:s)?(?:\s+video)?\s*[\)\]]",
     r"\s*[\(\[]\s*(?:official\s+)?visuali[sz]er\s*[\)\]]",
     r"\s*[\(\[]\s*(?:official\s+)?audio\s*[\)\]]",
-    r"\s*[\(\[]\s*full\s+album\s+stream\s*[\)\]]",
+    r"\s*[\(\[]\s*(?:full|complete)\s+(?:album|ep)(?:\s+stream)?\s*[\)\]]",
     r"\s*[\(\[]\s*(?:official|hd|hq|4k|lyrics?|explicit)\s*[\)\]]",
     r"\s*[-\u2013\u2014|]\s*(?:official\s+)?"
     r"(?:music\s+video|lyric(?:s)?(?:\s+video)?|audio|visuali[sz]er)\s*$",
@@ -76,13 +76,15 @@ _CREDIT_SEPARATOR = re.compile(
 
 
 def safe_name(value: str | None, fallback: str) -> str:
-    cleaned = (value or "").strip() or fallback
-    cleaned = re.sub(r'[<>:"/\\|?*]', "_", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
-    if not cleaned or cleaned in {".", ".."}:
-        cleaned = fallback
-    encoded = cleaned.encode("utf-8")[:180]
-    return encoded.decode("utf-8", errors="ignore").rstrip(" .") or fallback
+    def clean_component(candidate: str) -> str:
+        candidate = re.sub(r'[\x00-\x1f\x7f<>:"/\\|?*]', "_", candidate.strip())
+        candidate = re.sub(r"\s+", " ", candidate).strip(" .")
+        if candidate in {"", ".", ".."}:
+            return ""
+        encoded = candidate.encode("utf-8")[:180]
+        return encoded.decode("utf-8", errors="ignore").rstrip(" .")
+
+    return clean_component(value or "") or clean_component(fallback) or "unnamed"
 
 
 def normalise_artist_case(name: str) -> str:
@@ -143,7 +145,8 @@ def _comparison_key(value: str) -> str:
         character for character in normalised if unicodedata.category(character) != "Mn"
     )
     normalised = re.sub(r"\s*&\s*", " and ", normalised)
-    return re.sub(r"[^a-z0-9]+", " ", normalised).strip()
+    normalised = "".join(character if character.isalnum() else " " for character in normalised)
+    return re.sub(r"\s+", " ", normalised).strip()
 
 
 def primary_artist(name: str) -> str:
@@ -295,7 +298,7 @@ def prefer_filename_artist(stem: str, tagged_artist: str) -> str:
         cleaned_tagged_artist = clean_channel_artist(tagged_artist)
         if artists_match(cleaned_tagged_artist, guessed_artist):
             return preferred_artist_name(cleaned_tagged_artist, guessed_artist)
-        return normalise_filename_artist_case(guessed_artist)
+        return normalise_filename_artist_case(cleaned_tagged_artist)
     return normalise_artist_case(tagged_artist)
 
 
