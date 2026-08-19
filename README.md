@@ -142,3 +142,10 @@ python3 -m venv .venv
 .venv/bin/ruff check .
 .venv/bin/pytest
 ```
+
+## License
+
+Copyright (C) 2026 THE-M0P
+
+This project is licensed under the GNU Affero General Public License, version 3 only. See
+[`LICENSE`](LICENSE) for the complete terms.
