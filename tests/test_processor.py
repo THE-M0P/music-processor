@@ -311,3 +311,171 @@ def test_long_album_upload_uses_title_artist_and_release_group(
     assert written[0].artist == "TISM"
     assert written[0].album == "Hot Dogma"
     assert (processor.settings.library / "TISM" / "Hot Dogma" / "Hot Dogma (1990).mp3").exists()
+
+
+def test_title_artist_replaces_uploader_for_fingerprinting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SnooperFingerprint:
+        def fingerprint(
+            self,
+            path: Path,
+            expected_artist: str = "",
+            expected_title: str = "",
+        ) -> FingerprintResult:
+            assert expected_artist == "Snõõper"
+            assert expected_title == "INVENTORY"
+            return FingerprintResult(
+                artist="Snõõper",
+                album_artist="Snõõper",
+                title="Inventory",
+                score=0.99,
+            )
+
+    processor = make_processor(tmp_path)
+    processor.acoustid = SnooperFingerprint()  # type: ignore[assignment]
+    uploaded = (
+        processor.settings.uploads
+        / "Harakiri Diat - SNÕÕPER - INVENTORY (OFFICIAL MUSIC VIDEO).mp3"
+    )
+    uploaded.write_bytes(b"audio")
+    monkeypatch.setattr(
+        "music_processor.processor.read_tags",
+        lambda path: Tags(
+            artist="Harakiri Diat",
+            album_artist="Harakiri Diat",
+            title="SNÕÕPER - INVENTORY (OFFICIAL MUSIC VIDEO)",
+        ),
+    )
+    monkeypatch.setattr("music_processor.processor.write_tags", lambda path, tags: None)
+
+    processor.process_pending()
+
+    assert (
+        processor.settings.library / "Snõõper" / "Singles & Miscellaneous" / "Inventory.mp3"
+    ).exists()
+
+
+def test_same_source_url_removes_repeat_instead_of_creating_collision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = make_processor(tmp_path)
+    uploaded = processor.settings.uploads / "Artist - Title.mp3"
+    uploaded.write_bytes(b"repeat")
+    existing = processor.settings.library / "Artist" / "Album" / "Title.mp3"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"original")
+    source_url = "https://www.youtube.com/watch?v=video-id"
+
+    def tags_for(path: Path) -> Tags:
+        return Tags(
+            artist="Artist",
+            album="Album",
+            title="Title",
+            source_url=source_url,
+        )
+
+    monkeypatch.setattr("music_processor.processor.read_tags", tags_for)
+    monkeypatch.setattr(
+        "music_processor.processor.write_tags",
+        lambda path, tags: pytest.fail("duplicate must not be retagged"),
+    )
+
+    summary = processor.process_pending()
+
+    assert summary.duplicates_removed == 1
+    assert summary.imported == 0
+    assert not uploaded.exists()
+    assert existing.read_bytes() == b"original"
+
+
+def test_same_title_from_different_source_keeps_both_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = make_processor(tmp_path)
+    uploaded = processor.settings.uploads / "Artist - Title.mp3"
+    uploaded.write_bytes(b"alternate")
+    existing = processor.settings.library / "Artist" / "Album" / "Title.mp3"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"original")
+
+    def tags_for(path: Path) -> Tags:
+        source = "new" if path == uploaded else "old"
+        return Tags(artist="Artist", album="Album", title="Title", source_url=source)
+
+    monkeypatch.setattr("music_processor.processor.read_tags", tags_for)
+    monkeypatch.setattr("music_processor.processor.write_tags", lambda path, tags: None)
+
+    summary = processor.process_pending()
+
+    assert summary.imported == 1
+    assert (existing.parent / "Title (2).mp3").read_bytes() == b"alternate"
+
+
+def test_short_self_titled_ep_with_chapters_uses_release_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EpMusicBrainz(FakeMusicBrainz):
+        def find_studio_album_release(self, artist: str, title: str) -> str:
+            self.release_calls.append((artist, title))
+            return "Snooper"
+
+    musicbrainz = EpMusicBrainz()
+
+    class UnexpectedFingerprint:
+        def fingerprint(self, *args, **kwargs):
+            pytest.fail("multi-track release must not be matched as one recording")
+
+    processor = make_processor(tmp_path)
+    processor.musicbrainz = musicbrainz  # type: ignore[assignment]
+    processor.acoustid = UnexpectedFingerprint()  # type: ignore[assignment]
+    uploaded = processor.settings.uploads / "Harakiri Diat - Snõõper - S⧸T EP.mp3"
+    uploaded.write_bytes(b"audio")
+    written: list[Tags] = []
+    monkeypatch.setattr(
+        "music_processor.processor.read_tags",
+        lambda path: Tags(artist="Harakiri Diat", title="Snõõper - S/T EP"),
+    )
+    monkeypatch.setattr("music_processor.processor.audio_duration", lambda path: 430.0)
+    monkeypatch.setattr("music_processor.processor.audio_chapter_count", lambda path: 5)
+    monkeypatch.setattr(
+        "music_processor.processor.write_tags",
+        lambda path, tags: written.append(tags),
+    )
+
+    processor.process_pending()
+
+    assert musicbrainz.release_calls == [("Snõõper", "Snõõper")]
+    assert written[0].artist == "Snõõper"
+    assert written[0].album == "Snõõper"
+
+
+def test_chaptered_release_without_match_uses_release_title_as_album(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = make_processor(tmp_path)
+    uploaded = processor.settings.uploads / "SNõõPER TV - Snõõper - Halloween.mp3"
+    uploaded.write_bytes(b"audio")
+    written: list[Tags] = []
+    monkeypatch.setattr(
+        "music_processor.processor.read_tags",
+        lambda path: Tags(artist="SNõõPER TV", title="Snõõper - Halloween"),
+    )
+    monkeypatch.setattr("music_processor.processor.audio_duration", lambda path: 600.0)
+    monkeypatch.setattr("music_processor.processor.audio_chapter_count", lambda path: 4)
+    monkeypatch.setattr(
+        "music_processor.processor.write_tags",
+        lambda path, tags: written.append(tags),
+    )
+
+    processor.process_pending()
+
+    assert written[0].artist == "Snõõper"
+    assert written[0].album_artist == "Snõõper"
+    assert written[0].album == "Halloween"
+    assert (processor.settings.library / "Snõõper" / "Halloween" / "Halloween.mp3").exists()

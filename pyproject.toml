@@ -37,4 +37,4 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
-allowed-confusables = ["‘", "’", "–"]
+allowed-confusables = ["‘", "’", "–", "⧸"]

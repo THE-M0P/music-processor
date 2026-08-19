@@ -36,8 +36,10 @@ not treated as artist separators, so names such as `Tyler, The Creator` remain i
   directories under the failed-file path.
 - Name collisions retain both files by adding `(2)`, `(3)`, and so on. The processor never assumes
   that matching artist and title strings prove two recordings are duplicates.
+- A repeated download with the same embedded source URL and destination is removed instead of
+  creating another numbered copy. Different source URLs still retain both files.
 - Every successful import can be recorded as JSON Lines, including its metadata source, confidence,
-  original title, destination, and available external identifiers.
+  original title, source URL, destination, and available external identifiers.
 
 MeTube should use a temporary directory below its private state directory rather than the watched
 upload directory. For example:
@@ -83,7 +85,7 @@ The default paths match a library mounted at `/mnt/music`:
 | Incoming files | `/mnt/music/uploads` | `MUSIC_UPLOADS_DIR` |
 | Organised library | `/mnt/music/Music` | `MUSIC_LIBRARY_DIR` |
 | Failed files | `/mnt/music/failed` | `MUSIC_QUARANTINE_DIR` |
-| Instance lock | `/tmp/music-processor.lock` | `MUSIC_PROCESSOR_LOCK_FILE` |
+| Instance lock | User runtime or temporary directory | `MUSIC_PROCESSOR_LOCK_FILE` |
 | Decision log | Disabled | `MUSIC_PROCESSOR_DECISION_LOG` |
 | Fallback album | `Singles & Miscellaneous` | `MUSIC_PROCESSOR_FALLBACK_ALBUM` |
 | MusicBrainz contact | Project URL | `MUSICBRAINZ_CONTACT` |

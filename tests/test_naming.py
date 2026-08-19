@@ -3,7 +3,10 @@ from music_processor.naming import (
     canonical_song_title,
     clean_title,
     merge_version_title,
+    prefer_filename_artist,
     primary_artist,
+    release_lookup_title,
+    safe_name,
     split_upload_filename,
     version_labels,
 )
@@ -81,3 +84,48 @@ def test_official_channel_name_is_cleaned() -> None:
         "Great White",
         "Bad Boys",
     )
+
+
+def test_embedded_title_artist_wins_over_unrelated_uploader_tag() -> None:
+    assert (
+        prefer_filename_artist(
+            "Harakiri Diat - SNÕÕPER - INVENTORY (OFFICIAL MUSIC VIDEO)",
+            "Harakiri Diat",
+        )
+        == "Snõõper"
+    )
+
+
+def test_channel_suffix_is_removed_when_channel_is_the_artist() -> None:
+    assert (
+        prefer_filename_artist(
+            "SNõõPER TV - Snõõper - Powerball (Official Music Video)",
+            "SNõõPER TV",
+        )
+        == "Snõõper"
+    )
+
+
+def test_official_channel_spelling_canonicalises_plain_title_artist() -> None:
+    assert (
+        prefer_filename_artist(
+            "SNõõPER TV - Snooper - Guard Dog (Official Video)",
+            "SNõõPER TV",
+        )
+        == "Snõõper"
+    )
+
+
+def test_equivalent_diacritic_artist_prefix_without_spaced_dash_is_removed() -> None:
+    assert clean_title("Snōōper- DEFECT", "Snõõper") == "DEFECT"
+
+
+def test_self_titled_ep_uses_artist_as_release_lookup() -> None:
+    assert release_lookup_title("S⧸T EP", "Snõõper") == "Snõõper"
+
+
+def test_safe_name_obeys_utf8_component_budget() -> None:
+    name = safe_name("🎵" * 100, "fallback")
+
+    assert len(name.encode("utf-8")) <= 180
+    assert name

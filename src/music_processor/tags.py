@@ -26,6 +26,7 @@ class Tags:
     recording_id: str = ""
     release_group_id: str = ""
     acoustid_id: str = ""
+    source_url: str = ""
 
 
 class TaggingError(RuntimeError):
@@ -65,6 +66,9 @@ def _read_id3_tags(path: Path) -> Tags:
         recording_id=_txxx_value(audio.tags, "MusicBrainz Recording Id"),
         release_group_id=_txxx_value(audio.tags, "MusicBrainz Release Group Id"),
         acoustid_id=_txxx_value(audio.tags, "AcoustID Id"),
+        source_url=(
+            _txxx_value(audio.tags, "Music Processor Source URL") or _txxx_value(audio.tags, "purl")
+        ),
     )
 
 
@@ -84,6 +88,15 @@ def audio_duration(path: Path) -> float:
         return float(getattr(getattr(audio, "info", None), "length", 0.0))
     except Exception:
         return 0.0
+
+
+def audio_chapter_count(path: Path) -> int:
+    try:
+        audio = MutagenFile(path)
+        tags = getattr(audio, "tags", None)
+        return sum(str(key).startswith("CHAP:") for key in tags or ())
+    except Exception:
+        return 0
 
 
 def _write_id3_tags(path: Path, tags: Tags) -> None:
@@ -106,6 +119,7 @@ def _write_id3_tags(path: Path, tags: Tags) -> None:
     _set_txxx(audio.tags, "MusicBrainz Recording Id", tags.recording_id)
     _set_txxx(audio.tags, "MusicBrainz Release Group Id", tags.release_group_id)
     _set_txxx(audio.tags, "AcoustID Id", tags.acoustid_id)
+    _set_txxx(audio.tags, "Music Processor Source URL", tags.source_url)
     audio.save()
 
 
@@ -143,10 +157,11 @@ def _txxx_value(tags: object, description: str) -> str:
 
 
 def _set_txxx(tags: object, description: str, value: str) -> None:
-    if not value:
-        return
     setter = getattr(tags, "setall", None)
     if setter is None:
+        return
+    if not value:
+        setter(f"TXXX:{description}", [])
         return
     setter(
         f"TXXX:{description}",

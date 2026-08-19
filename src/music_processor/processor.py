@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import time
 from dataclasses import asdict, dataclass
@@ -19,7 +20,10 @@ from music_processor.naming import (
     clean_title,
     merge_version_title,
     normalise_artist_case,
+    prefer_filename_artist,
+    preferred_artist_name,
     primary_artist,
+    release_lookup_title,
     safe_name,
     split_upload_filename,
 )
@@ -27,6 +31,7 @@ from music_processor.tags import (
     SUPPORTED_EXTENSIONS,
     TaggingError,
     Tags,
+    audio_chapter_count,
     audio_duration,
     read_tags,
     write_tags,
@@ -45,6 +50,7 @@ class ProcessingSummary:
     quarantined: int = 0
     deferred: int = 0
     failed: int = 0
+    duplicates_removed: int = 0
 
 
 class MusicProcessor:
@@ -104,8 +110,18 @@ class MusicProcessor:
             return
 
         current = read_tags(path)
-        artist = normalise_artist_case(current.artist.strip())
+        tagged_artist = normalise_artist_case(current.artist.strip())
+        artist = tagged_artist
+        if not current.album:
+            artist = prefer_filename_artist(path.stem, tagged_artist)
         album_artist = current.album_artist.strip() or primary_artist(artist)
+        if (
+            current.album_artist
+            and tagged_artist
+            and artists_match(current.album_artist, tagged_artist)
+            and not artists_match(current.album_artist, artist)
+        ):
+            album_artist = primary_artist(artist)
         source_title = current.source_title or current.title or self._filename_title(path)
         LOGGER.info(
             "Read metadata for %s: artist=%r albumartist=%r album=%r title=%r",
@@ -128,20 +144,37 @@ class MusicProcessor:
                 recording_id=current.recording_id,
                 release_group_id=current.release_group_id,
                 acoustid_id=current.acoustid_id,
+                source_url=current.source_url,
             )
             self._finish_import(path, tags, summary)
             return
 
+        guessed_artist, guessed_title = self._guess_from_filename(
+            path,
+            artist,
+            current.title,
+        )
+        release_title = release_lookup_title(guessed_title, guessed_artist)
+        duration = audio_duration(path)
+        chapter_count = audio_chapter_count(path)
+        is_release_upload = (
+            duration >= 20 * 60 or chapter_count > 1 or release_title != guessed_title
+        )
         cleaned_source_title = clean_title(source_title, artist)
-        fingerprint = self._fingerprint(path, artist, cleaned_source_title)
+        if is_release_upload:
+            LOGGER.info("Skipping single-recording fingerprint for release upload %s", path.name)
+            fingerprint = FingerprintResult()
+        else:
+            fingerprint = self._fingerprint(path, artist, cleaned_source_title)
         if fingerprint.artist or fingerprint.title:
-            final_artist = fingerprint.artist or artist
-            if artist and fingerprint.artist and artists_match(artist, fingerprint.artist):
-                final_artist = artist
-            final_artist = normalise_artist_case(final_artist)
-            final_album_artist = (
-                fingerprint.album_artist or album_artist or primary_artist(final_artist)
-            )
+            final_artist = preferred_artist_name(artist, fingerprint.artist)
+            if fingerprint.album_artist and not artists_match(
+                fingerprint.album_artist,
+                final_artist,
+            ):
+                final_album_artist = fingerprint.album_artist
+            else:
+                final_album_artist = primary_artist(final_artist)
             final_title = merge_version_title(
                 fingerprint.title or cleaned_source_title,
                 cleaned_source_title,
@@ -164,15 +197,11 @@ class MusicProcessor:
                 recording_id=fingerprint.recording_id,
                 release_group_id=fingerprint.release_group_id,
                 acoustid_id=fingerprint.acoustid_id,
+                source_url=current.source_url,
             )
             self._finish_import(path, tags, summary)
             return
 
-        guessed_artist, guessed_title = self._guess_from_filename(
-            path,
-            artist,
-            current.title,
-        )
         if not guessed_artist and not guessed_title:
             self._quarantine(path, "unidentified")
             summary.quarantined += 1
@@ -185,11 +214,17 @@ class MusicProcessor:
                 lookup_artist,
                 canonical_song_title(guessed_title),
             )
-            if not guessed_album and audio_duration(path) >= 20 * 60:
+            if not guessed_album and is_release_upload:
                 guessed_album = self.musicbrainz.find_studio_album_release(
                     lookup_artist,
-                    guessed_title,
+                    release_title,
                 )
+            if release_title != guessed_title and (
+                not guessed_album or artists_match(guessed_album, guessed_artist)
+            ):
+                guessed_album = clean_album(release_title)
+            if not guessed_album and chapter_count > 1:
+                guessed_album = clean_album(guessed_title)
         tags = Tags(
             artist=guessed_artist,
             album_artist=lookup_artist or guessed_artist,
@@ -198,6 +233,7 @@ class MusicProcessor:
             source_title=source_title,
             match_source="filename",
             confidence=0.25,
+            source_url=current.source_url,
         )
         self._finish_import(path, tags, summary)
 
@@ -228,8 +264,36 @@ class MusicProcessor:
             recording_id=tags.recording_id,
             release_group_id=tags.release_group_id,
             acoustid_id=tags.acoustid_id,
+            source_url=tags.source_url,
         )
-        destination = self._library_destination(path, final_tags)
+        base_destination = self._base_library_destination(path, final_tags)
+        duplicate = self._matching_source_destination(
+            base_destination,
+            final_tags.source_url,
+        )
+        if duplicate is not None:
+            if self.settings.dry_run:
+                LOGGER.info(
+                    "Dry run: would remove duplicate %s already imported as %s", path, duplicate
+                )
+            else:
+                path.unlink()
+                try:
+                    self._record_decision(
+                        path,
+                        duplicate,
+                        final_tags,
+                        action="duplicate-removed",
+                    )
+                except OSError:
+                    LOGGER.exception("Could not append duplicate decision for %s", path.name)
+                LOGGER.info(
+                    "Removed duplicate download %s already imported as %s", path.name, duplicate
+                )
+            summary.duplicates_removed += 1
+            return
+
+        destination = self._available_path(base_destination)
 
         if self.settings.dry_run:
             LOGGER.info("Dry run: would import %s to %s", path, destination)
@@ -258,13 +322,24 @@ class MusicProcessor:
         )
         summary.imported += 1
 
-    def _library_destination(self, path: Path, tags: Tags) -> Path:
+    def _base_library_destination(self, path: Path, tags: Tags) -> Path:
         album_artist = safe_name(tags.album_artist or tags.artist, "Unknown Artist")
         album = safe_name(tags.album, self.settings.fallback_album)
         title = safe_name(tags.title, path.stem)
-        return self._available_path(
-            self.settings.library / album_artist / album / f"{title}{path.suffix.lower()}"
-        )
+        return self.settings.library / album_artist / album / f"{title}{path.suffix.lower()}"
+
+    def _matching_source_destination(self, path: Path, source_url: str) -> Path | None:
+        if not source_url or not path.parent.is_dir():
+            return None
+        numbered = re.compile(rf"^{re.escape(path.stem)} \([0-9]+\)$")
+        for candidate in path.parent.iterdir():
+            if not candidate.is_file() or candidate.suffix.casefold() != path.suffix.casefold():
+                continue
+            if candidate.stem != path.stem and not numbered.fullmatch(candidate.stem):
+                continue
+            if read_tags(candidate).source_url == source_url:
+                return candidate
+        return None
 
     def _remove_sidecar(self, path: Path) -> None:
         if self.settings.dry_run:
@@ -282,13 +357,21 @@ class MusicProcessor:
         shutil.move(str(path), destination)
         LOGGER.warning("Quarantined %s as %s", path.name, destination)
 
-    def _record_decision(self, source: Path, destination: Path, tags: Tags) -> None:
+    def _record_decision(
+        self,
+        source: Path,
+        destination: Path,
+        tags: Tags,
+        *,
+        action: str = "imported",
+    ) -> None:
         if self.settings.decision_log is None:
             return
         record = {
             "timestamp": datetime.now(UTC).isoformat(),
             "source": source.name,
             "destination": str(destination),
+            "action": action,
             "metadata": asdict(tags),
         }
         with self.settings.decision_log.open("a", encoding="utf-8") as output:

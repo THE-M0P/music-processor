@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import tempfile
 from pathlib import Path
 
 from music_processor.clients import AcoustIDClient, MusicBrainzClient
@@ -13,6 +14,12 @@ from music_processor.locking import AlreadyRunningError, single_instance
 from music_processor.processor import MusicProcessor
 
 DEFAULT_CONTACT = "https://github.com/THE-M0P/music-processor"
+
+
+def default_lock_file() -> Path:
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    root = Path(runtime_dir) if runtime_dir else Path(tempfile.gettempdir())
+    return root / f"music-processor-{os.getuid()}.lock"
 
 
 def environment_flag(name: str, default: bool = False) -> bool:
@@ -44,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lock-file",
         type=Path,
-        default=Path(os.environ.get("MUSIC_PROCESSOR_LOCK_FILE", "/tmp/music-processor.lock")),
+        default=Path(os.environ.get("MUSIC_PROCESSOR_LOCK_FILE", default_lock_file())),
     )
     parser.add_argument(
         "--musicbrainz-contact",
@@ -116,11 +123,12 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.getLogger(__name__).info(
         "Finished: discovered=%d imported=%d sidecars_removed=%d quarantined=%d "
-        "deferred=%d failed=%d",
+        "duplicates_removed=%d deferred=%d failed=%d",
         summary.discovered,
         summary.imported,
         summary.sidecars_removed,
         summary.quarantined,
+        summary.duplicates_removed,
         summary.deferred,
         summary.failed,
     )

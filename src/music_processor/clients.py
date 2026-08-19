@@ -16,6 +16,7 @@ import musicbrainzngs
 import requests
 
 from music_processor.naming import artists_match, normalise_artist
+from music_processor.tags import audio_duration
 
 LOGGER = logging.getLogger(__name__)
 
@@ -52,8 +53,13 @@ class AcoustIDClient:
         expected_title: str = "",
     ) -> FingerprintResult:
         try:
+            command = ["fpcalc", "-json"]
+            duration = audio_duration(path)
+            if duration > 1:
+                command.extend(("-length", str(min(120, max(1, int(duration) - 1)))))
+            command.append(str(path))
             completed = subprocess.run(
-                ["fpcalc", "-json", str(path)],
+                command,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -260,7 +266,7 @@ class MusicBrainzClient:
                 for candidate in result.get("release-group-list", [])
                 if int(candidate.get("ext:score", "0")) >= 95
                 and normalise_artist(candidate.get("title", "")) == normalise_artist(query)
-                and (candidate.get("primary-type") or candidate.get("type")) == "Album"
+                and (candidate.get("primary-type") or candidate.get("type")) in {"Album", "EP"}
                 and not candidate.get("secondary-type-list", [])
             ),
             "",

@@ -81,7 +81,8 @@ def safe_name(value: str | None, fallback: str) -> str:
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
     if not cleaned or cleaned in {".", ".."}:
         cleaned = fallback
-    return cleaned[:150]
+    encoded = cleaned.encode("utf-8")[:180]
+    return encoded.decode("utf-8", errors="ignore").rstrip(" .") or fallback
 
 
 def normalise_artist_case(name: str) -> str:
@@ -103,6 +104,37 @@ def normalise_artist_case(name: str) -> str:
         else:
             result.append(word[0].upper() + word[1:])
     return " ".join(result)
+
+
+def normalise_filename_artist_case(name: str) -> str:
+    normalised = normalise_artist_case(name)
+    words = []
+    for word in normalised.split():
+        letters = [character for character in word if character.isalpha()]
+        uppercase_ratio = (
+            sum(character.isupper() for character in letters) / len(letters) if letters else 0
+        )
+        if len(letters) > 5 and uppercase_ratio >= 0.7:
+            word = word[0].upper() + word[1:].lower()
+        words.append(word)
+    return " ".join(words)
+
+
+def preferred_artist_name(source: str, matched: str) -> str:
+    if not matched:
+        return normalise_filename_artist_case(source)
+    if not source or not artists_match(source, matched):
+        return normalise_artist_case(matched)
+
+    def has_diacritics(value: str) -> bool:
+        decomposed = unicodedata.normalize("NFKD", value)
+        return any(unicodedata.category(character) == "Mn" for character in decomposed)
+
+    if has_diacritics(source):
+        return normalise_filename_artist_case(source)
+    if has_diacritics(matched):
+        return normalise_artist_case(matched)
+    return normalise_artist_case(matched)
 
 
 def _comparison_key(value: str) -> str:
@@ -177,6 +209,12 @@ def is_clean_title(title: str) -> bool:
 def clean_title(title: str, artist: str = "") -> str:
     cleaned = title.strip()
     if artist:
+        prefix_match = re.match(
+            r"^(?P<prefix>.+?)\s*[-\u2013\u2014:|]\s*(?P<title>.+)$",
+            cleaned,
+        )
+        if prefix_match and artists_match(artist, prefix_match.group("prefix")):
+            cleaned = prefix_match.group("title").strip()
         for separator in (r"\s*[-\u2013\u2014]\s*", r"\s*:\s*", r"\s*\|\s*"):
             prefix = re.escape(artist.strip()) + separator
             while re.match(f"^{prefix}", cleaned, flags=re.IGNORECASE):
@@ -244,6 +282,27 @@ def split_upload_filename(stem: str) -> tuple[str, str]:
     if len(remaining) == 1 and version_labels(f"Song ({remaining[0]})"):
         return clean_channel_artist(first), " - ".join(parts[1:])
     return clean_channel_artist(second), " - ".join(remaining)
+
+
+def prefer_filename_artist(stem: str, tagged_artist: str) -> str:
+    guessed_artist, _ = split_upload_filename(stem)
+    if not tagged_artist:
+        return normalise_filename_artist_case(guessed_artist)
+    if " - " not in stem or not guessed_artist:
+        return normalise_artist_case(tagged_artist)
+    uploader = stem.split(" - ", maxsplit=1)[0].strip()
+    if artists_match(tagged_artist, uploader):
+        cleaned_tagged_artist = clean_channel_artist(tagged_artist)
+        if artists_match(cleaned_tagged_artist, guessed_artist):
+            return preferred_artist_name(cleaned_tagged_artist, guessed_artist)
+        return normalise_filename_artist_case(guessed_artist)
+    return normalise_artist_case(tagged_artist)
+
+
+def release_lookup_title(title: str, artist: str) -> str:
+    if _comparison_key(title) in {"s t", "s t ep", "self titled", "self titled ep"}:
+        return artist
+    return title
 
 
 def canonical_song_title(title: str) -> str:

@@ -148,6 +148,20 @@ def test_acoustid_request_error_does_not_log_api_key(monkeypatch, caplog, tmp_pa
     assert fingerprint not in caplog.text
 
 
+def test_short_track_limits_fpcalc_below_audio_duration(monkeypatch, tmp_path: Path) -> None:
+    commands: list[list[str]] = []
+    monkeypatch.setattr("music_processor.clients.audio_duration", lambda path: 66.2)
+
+    def run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, '{"duration": 65, "fingerprint": ""}', "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert AcoustIDClient("key").fingerprint(tmp_path / "short.mp3") == FingerprintResult()
+    assert commands == [["fpcalc", "-json", "-length", "65", str(tmp_path / "short.mp3")]]
+
+
 def test_musicbrainz_searches_enough_recordings_to_find_studio_album(monkeypatch) -> None:
     monkeypatch.setattr(
         "music_processor.clients.musicbrainzngs.search_artists",
@@ -211,3 +225,21 @@ def test_musicbrainz_recognises_long_form_album_title(monkeypatch) -> None:
     client = MusicBrainzClient("https://example.com")
 
     assert client.find_studio_album_release("TISM", "Hot Dogma (1990)") == "Hot Dogma"
+
+
+def test_musicbrainz_accepts_ep_release_group(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "music_processor.clients.musicbrainzngs.search_artists",
+        lambda **kwargs: {"artist-list": [{"id": "artist-id", "name": "Snõõper"}]},
+    )
+    monkeypatch.setattr(
+        "music_processor.clients.musicbrainzngs.search_release_groups",
+        lambda **kwargs: {
+            "release-group-list": [{"title": "Snõõper", "primary-type": "EP", "ext:score": "100"}]
+        },
+    )
+
+    assert (
+        MusicBrainzClient("https://example.com").find_studio_album_release("Snõõper", "Snõõper")
+        == "Snõõper"
+    )
