@@ -64,3 +64,51 @@ def test_rewrite_clears_stale_processor_identifiers(tmp_path: Path) -> None:
     write_tags(path, replacement)
 
     assert read_tags(path) == replacement
+
+
+def test_mp3_approval_marker_round_trip_and_clear(tmp_path: Path) -> None:
+    import shutil
+    import subprocess
+
+    import pytest
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("ffmpeg is required for this MP3 tag test")
+
+    path = tmp_path / "approved.mp3"
+    subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel", "error",
+            "-f", "lavfi",
+            "-i", "sine=frequency=440:duration=1",
+            "-q:a", "9",
+            "-y",
+            str(path),
+        ],
+        check=True,
+    )
+
+    approved_tags = Tags(
+        artist="Test Artist",
+        album="Singles & Miscellaneous",
+        title="Test Track",
+        album_artist="Test Artist",
+        approved=True,
+    )
+
+    write_tags(path, approved_tags)
+    assert read_tags(path) == approved_tags
+
+    unapproved_tags = Tags(
+        artist="Test Artist",
+        album="Singles & Miscellaneous",
+        title="Test Track",
+        album_artist="Test Artist",
+        approved=False,
+    )
+
+    write_tags(path, unapproved_tags)
+    assert read_tags(path) == unapproved_tags

@@ -31,6 +31,7 @@ class Tags:
     album_artist_source: str = ""
     album_source: str = ""
     title_source: str = ""
+    approved: bool = False
 
 
 class TaggingError(RuntimeError):
@@ -77,6 +78,9 @@ def _read_id3_tags(path: Path) -> Tags:
         album_artist_source=_txxx_value(audio.tags, "Music Processor Album Artist Source"),
         album_source=_txxx_value(audio.tags, "Music Processor Album Source"),
         title_source=_txxx_value(audio.tags, "Music Processor Title Source"),
+        approved=(
+            _txxx_value(audio.tags, "Music Processor Approved").casefold() == "yes"
+        ),
     )
 
 
@@ -132,6 +136,11 @@ def _write_id3_tags(path: Path, tags: Tags) -> None:
     _set_txxx(audio.tags, "Music Processor Album Artist Source", tags.album_artist_source)
     _set_txxx(audio.tags, "Music Processor Album Source", tags.album_source)
     _set_txxx(audio.tags, "Music Processor Title Source", tags.title_source)
+    _set_txxx(
+        audio.tags,
+        "Music Processor Approved",
+        "yes" if tags.approved else "",
+    )
     audio.save()
 
 

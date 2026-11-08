@@ -158,8 +158,11 @@ class MusicProcessor:
         )
         tags = self._resolve_tags(path, context)
         if tags is None:
-            self._quarantine(path, "unidentified")
-            summary.quarantined += 1
+            LOGGER.info(
+                "Deferring file pending metadata approval or a reliable match: %s",
+                path.name,
+            )
+            summary.deferred += 1
             return
         self._finish_import(path, tags, summary)
 
@@ -210,29 +213,72 @@ class MusicProcessor:
         )
 
     def _resolve_tags(self, path: Path, context: ResolutionContext) -> Tags | None:
-        if context.artist and context.current.album:
-            return self._existing_tags(context)
+        if context.current.approved:
+            if not context.current.artist.strip() or not context.current.title.strip():
+                LOGGER.warning(
+                    "Approval marker found but Artist or Title is missing; deferring %s",
+                    path.name,
+                )
+                return None
+            LOGGER.info("Using manually approved metadata for %s", path.name)
+            return self._approved_tags(context)
 
         cleaned_source_title = clean_title(context.source_title, context.artist)
         if context.is_release_upload:
             LOGGER.info("Skipping single-recording fingerprint for release upload %s", path.name)
-            fingerprint = FingerprintResult()
-        else:
-            alternate_artists = (
-                (context.filename_artist,)
-                if context.filename_artist
-                and not artists_match(context.artist, context.filename_artist)
-                else ()
-            )
-            fingerprint = self._fingerprint(
-                path,
-                context.artist,
-                cleaned_source_title,
-                alternate_artists,
-            )
-        if fingerprint.artist or fingerprint.title:
+            return None
+
+        alternate_artists = (
+            (context.filename_artist,)
+            if context.filename_artist
+            and not artists_match(context.artist, context.filename_artist)
+            else ()
+        )
+        fingerprint = self._fingerprint(
+            path,
+            context.artist,
+            cleaned_source_title,
+            alternate_artists,
+        )
+
+        if (
+            fingerprint.artist
+            and fingerprint.title
+            and fingerprint.score >= 0.90
+        ):
             return self._fingerprint_tags(context, fingerprint, cleaned_source_title)
-        return self._filename_tags(context)
+
+        LOGGER.info(
+            "Deferring %s: no sufficiently reliable metadata match (confidence %.3f)",
+            path.name,
+            fingerprint.score,
+        )
+        return None
+
+    @staticmethod
+    def _approved_tags(context: ResolutionContext) -> Tags:
+        current = context.current
+        artist = current.artist.strip()
+        title = current.title.strip()
+
+        return Tags(
+            artist=artist,
+            album_artist=current.album_artist.strip() or primary_artist(artist),
+            album=clean_album(current.album),
+            title=title,
+            source_title=current.source_title or title,
+            match_source=current.match_source or "manual-approval",
+            confidence=current.confidence or 1.0,
+            recording_id=current.recording_id,
+            release_group_id=current.release_group_id,
+            acoustid_id=current.acoustid_id,
+            source_url=current.source_url,
+            artist_source=current.artist_source or "manual-approval",
+            album_artist_source=current.album_artist_source or "manual-approval",
+            album_source=current.album_source or "manual-approval",
+            title_source=current.title_source or "manual-approval",
+            approved=True,
+        )
 
     @staticmethod
     def _existing_tags(context: ResolutionContext) -> Tags:
@@ -253,6 +299,7 @@ class MusicProcessor:
             album_artist_source=current.album_artist_source or "existing-tags",
             album_source=current.album_source or "existing-tags",
             title_source=current.title_source or "existing-tags",
+            approved=current.approved,
         )
 
     def _fingerprint_tags(
@@ -501,6 +548,7 @@ class MusicProcessor:
             album_artist_source=tags.album_artist_source or "derived-artist",
             album_source=tags.album_source or "fallback",
             title_source=tags.title_source or "fallback",
+            approved=tags.approved,
         )
 
     def _compare_source(
