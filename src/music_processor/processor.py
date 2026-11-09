@@ -158,8 +158,11 @@ class MusicProcessor:
         )
         tags = self._resolve_tags(path, context)
         if tags is None:
-            self._quarantine(path, "unidentified")
-            summary.quarantined += 1
+            LOGGER.info(
+                "Deferring file pending metadata approval or a reliable match: %s",
+                path.name,
+            )
+            summary.deferred += 1
             return
         self._finish_import(path, tags, summary)
 
@@ -210,29 +213,114 @@ class MusicProcessor:
         )
 
     def _resolve_tags(self, path: Path, context: ResolutionContext) -> Tags | None:
-        if context.artist and context.current.album:
-            return self._existing_tags(context)
+        if context.current.approved:
+            if not context.current.artist.strip() or not context.current.title.strip():
+                LOGGER.warning(
+                    "Approval marker found but Artist or Title is missing; deferring %s",
+                    path.name,
+                )
+                return None
+            LOGGER.info("Using manually approved metadata for %s", path.name)
+            return self._approved_tags(context)
 
         cleaned_source_title = clean_title(context.source_title, context.artist)
         if context.is_release_upload:
-            LOGGER.info("Skipping single-recording fingerprint for release upload %s", path.name)
-            fingerprint = FingerprintResult()
-        else:
-            alternate_artists = (
-                (context.filename_artist,)
-                if context.filename_artist
-                and not artists_match(context.artist, context.filename_artist)
-                else ()
+            reason = (
+                "Release upload contains multiple tracks or chapters; "
+                "manual metadata review required"
             )
-            fingerprint = self._fingerprint(
-                path,
-                context.artist,
-                cleaned_source_title,
-                alternate_artists,
-            )
-        if fingerprint.artist or fingerprint.title:
+            LOGGER.info("Marking release upload for manual review: %s", path.name)
+            return self._pending_review_tags(context, FingerprintResult(), reason)
+
+        alternate_artists = (
+            (context.filename_artist,)
+            if context.filename_artist
+            and not artists_match(context.artist, context.filename_artist)
+            else ()
+        )
+        fingerprint = self._fingerprint(
+            path,
+            context.artist,
+            cleaned_source_title,
+            alternate_artists,
+        )
+
+        if (
+            fingerprint.artist
+            and fingerprint.title
+            and fingerprint.score >= 0.90
+        ):
             return self._fingerprint_tags(context, fingerprint, cleaned_source_title)
-        return self._filename_tags(context)
+
+        if fingerprint.score > 0 and fingerprint.artist and fingerprint.title:
+            reason = (
+                f"AcoustID confidence {fingerprint.score:.3f} is below "
+                "the 0.900 threshold; manual review required"
+            )
+        elif fingerprint.score > 0:
+            reason = (
+                f"AcoustID returned an incomplete match "
+                f"(confidence {fingerprint.score:.3f}); manual review required"
+            )
+        elif self.acoustid is None:
+            reason = "AcoustID lookup unavailable; manual metadata review required"
+        else:
+            reason = "No reliable AcoustID match was found; manual review required"
+
+        LOGGER.info("Marking %s for manual metadata review: %s", path.name, reason)
+        return self._pending_review_tags(context, fingerprint, reason)
+
+    @staticmethod
+    def _pending_review_tags(
+        context: ResolutionContext,
+        fingerprint: FingerprintResult,
+        reason: str,
+    ) -> Tags:
+        current = context.current
+        return Tags(
+            artist=current.artist.strip(),
+            album_artist=current.album_artist.strip() or current.artist.strip(),
+            album=current.album,
+            title=current.title.strip(),
+            source_title=context.source_title,
+            match_source=current.match_source or "pending-review",
+            confidence=fingerprint.score,
+            recording_id=fingerprint.recording_id or current.recording_id,
+            release_group_id=fingerprint.release_group_id or current.release_group_id,
+            acoustid_id=fingerprint.acoustid_id or current.acoustid_id,
+            source_url=current.source_url,
+            artist_source=current.artist_source,
+            album_artist_source=current.album_artist_source,
+            album_source=current.album_source,
+            title_source=current.title_source,
+            review_status="pending",
+            review_reason=reason,
+        )
+
+    @staticmethod
+    def _approved_tags(context: ResolutionContext) -> Tags:
+        current = context.current
+        artist = current.artist.strip()
+        title = current.title.strip()
+
+        return Tags(
+            artist=artist,
+            album_artist=current.album_artist.strip() or primary_artist(artist),
+            album=clean_album(current.album),
+            title=title,
+            source_title=current.source_title or title,
+            match_source=current.match_source or "manual-approval",
+            confidence=current.confidence or 1.0,
+            recording_id=current.recording_id,
+            release_group_id=current.release_group_id,
+            acoustid_id=current.acoustid_id,
+            source_url=current.source_url,
+            artist_source=current.artist_source or "manual-approval",
+            album_artist_source=current.album_artist_source or "manual-approval",
+            album_source=current.album_source or "manual-approval",
+            title_source=current.title_source or "manual-approval",
+            approved=True,
+        )
 
     @staticmethod
     def _existing_tags(context: ResolutionContext) -> Tags:
@@ -253,6 +341,7 @@ class MusicProcessor:
             album_artist_source=current.album_artist_source or "existing-tags",
             album_source=current.album_source or "existing-tags",
             title_source=current.title_source or "existing-tags",
+            approved=current.approved,
         )
 
     def _fingerprint_tags(
@@ -501,6 +590,9 @@ class MusicProcessor:
             album_artist_source=tags.album_artist_source or "derived-artist",
             album_source=tags.album_source or "fallback",
             title_source=tags.title_source or "fallback",
+            approved=tags.approved,
+            review_status=tags.review_status,
+            review_reason=tags.review_reason,
         )
 
     def _compare_source(
@@ -591,6 +683,34 @@ class MusicProcessor:
         summary: ProcessingSummary,
     ) -> None:
         existing_tags = read_tags(existing)
+
+        if not tags.approved and (
+            existing_tags.approved or existing_tags.review_status == "pending"
+        ):
+            if self.settings.dry_run:
+                LOGGER.info(
+                    "Dry run: would preserve existing approved/pending source %s "
+                    "and discard incoming unapproved copy %s",
+                    existing,
+                    path,
+                )
+            else:
+                path.unlink()
+                self.source_registry.register(tags.source_url, existing, content_digest)
+                self._safe_record_decision(
+                    path,
+                    existing,
+                    tags,
+                    action="duplicate-removed",
+                )
+                LOGGER.info(
+                    "Preserved existing approved/pending source %s; removed incoming copy %s",
+                    existing,
+                    path.name,
+                )
+            summary.duplicates_removed += 1
+            return
+
         metadata_matches = self._resolved_metadata_matches(existing_tags, tags)
         if metadata_matches and existing == base_destination:
             if self.settings.dry_run:

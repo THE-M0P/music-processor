@@ -73,8 +73,35 @@ class AcoustIDClient:
                 alternate_artists,
             )
         except requests.RequestException as error:
+            response = error.response if isinstance(error, requests.HTTPError) else None
+            status = response.status_code if response is not None else None
+            details = ""
+
+            if response is not None:
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = {}
+
+                if isinstance(payload, dict):
+                    info = payload.get("error")
+                    if isinstance(info, dict):
+                        code = info.get("code")
+                        message = info.get("message")
+                        if isinstance(code, (int, str)) and isinstance(message, str):
+                            safe_message = message.replace(self.api_key, "[redacted]")
+                            if fingerprint_data is not None:
+                                safe_message = safe_message.replace(
+                                    fingerprint_data.fingerprint, "[redacted]"
+                                )
+                            details = f", AcoustID error {code}: {safe_message[:160]}"
+
             LOGGER.warning(
-                "AcoustID HTTP request failed for %s (%s)", path.name, type(error).__name__
+                "AcoustID HTTP request failed for %s (%s%s)%s",
+                path.name,
+                type(error).__name__,
+                f", HTTP {status}" if status is not None else "",
+                details,
             )
             return FingerprintResult()
         except (
