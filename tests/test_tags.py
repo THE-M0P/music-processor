@@ -91,6 +91,18 @@ def test_mp3_approval_marker_round_trip_and_clear(tmp_path: Path) -> None:
         check=True,
     )
 
+    pending_tags = Tags(
+        artist="Test Artist",
+        album="Singles & Miscellaneous",
+        title="Test Track",
+        album_artist="Test Artist",
+        review_status="pending",
+        review_reason="No reliable AcoustID match",
+    )
+
+    write_tags(path, pending_tags)
+    assert read_tags(path) == pending_tags
+
     approved_tags = Tags(
         artist="Test Artist",
         album="Singles & Miscellaneous",

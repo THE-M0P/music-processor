@@ -225,8 +225,12 @@ class MusicProcessor:
 
         cleaned_source_title = clean_title(context.source_title, context.artist)
         if context.is_release_upload:
-            LOGGER.info("Skipping single-recording fingerprint for release upload %s", path.name)
-            return None
+            reason = (
+                "Release upload contains multiple tracks or chapters; "
+                "manual metadata review required"
+            )
+            LOGGER.info("Marking release upload for manual review: %s", path.name)
+            return self._pending_review_tags(context, FingerprintResult(), reason)
 
         alternate_artists = (
             (context.filename_artist,)
@@ -248,12 +252,50 @@ class MusicProcessor:
         ):
             return self._fingerprint_tags(context, fingerprint, cleaned_source_title)
 
-        LOGGER.info(
-            "Deferring %s: no sufficiently reliable metadata match (confidence %.3f)",
-            path.name,
-            fingerprint.score,
+        if fingerprint.score > 0 and fingerprint.artist and fingerprint.title:
+            reason = (
+                f"AcoustID confidence {fingerprint.score:.3f} is below "
+                "the 0.900 threshold; manual review required"
+            )
+        elif fingerprint.score > 0:
+            reason = (
+                f"AcoustID returned an incomplete match "
+                f"(confidence {fingerprint.score:.3f}); manual review required"
+            )
+        elif self.acoustid is None:
+            reason = "AcoustID lookup unavailable; manual metadata review required"
+        else:
+            reason = "No reliable AcoustID match was found; manual review required"
+
+        LOGGER.info("Marking %s for manual metadata review: %s", path.name, reason)
+        return self._pending_review_tags(context, fingerprint, reason)
+
+    @staticmethod
+    def _pending_review_tags(
+        context: ResolutionContext,
+        fingerprint: FingerprintResult,
+        reason: str,
+    ) -> Tags:
+        current = context.current
+        return Tags(
+            artist=current.artist.strip(),
+            album_artist=current.album_artist.strip() or current.artist.strip(),
+            album=current.album,
+            title=current.title.strip(),
+            source_title=context.source_title,
+            match_source=current.match_source or "pending-review",
+            confidence=fingerprint.score,
+            recording_id=fingerprint.recording_id or current.recording_id,
+            release_group_id=fingerprint.release_group_id or current.release_group_id,
+            acoustid_id=fingerprint.acoustid_id or current.acoustid_id,
+            source_url=current.source_url,
+            artist_source=current.artist_source,
+            album_artist_source=current.album_artist_source,
+            album_source=current.album_source,
+            title_source=current.title_source,
+            review_status="pending",
+            review_reason=reason,
         )
-        return None
 
     @staticmethod
     def _approved_tags(context: ResolutionContext) -> Tags:
@@ -549,6 +591,8 @@ class MusicProcessor:
             album_source=tags.album_source or "fallback",
             title_source=tags.title_source or "fallback",
             approved=tags.approved,
+            review_status=tags.review_status,
+            review_reason=tags.review_reason,
         )
 
     def _compare_source(
@@ -639,6 +683,34 @@ class MusicProcessor:
         summary: ProcessingSummary,
     ) -> None:
         existing_tags = read_tags(existing)
+
+        if not tags.approved and (
+            existing_tags.approved or existing_tags.review_status == "pending"
+        ):
+            if self.settings.dry_run:
+                LOGGER.info(
+                    "Dry run: would preserve existing approved/pending source %s "
+                    "and discard incoming unapproved copy %s",
+                    existing,
+                    path,
+                )
+            else:
+                path.unlink()
+                self.source_registry.register(tags.source_url, existing, content_digest)
+                self._safe_record_decision(
+                    path,
+                    existing,
+                    tags,
+                    action="duplicate-removed",
+                )
+                LOGGER.info(
+                    "Preserved existing approved/pending source %s; removed incoming copy %s",
+                    existing,
+                    path.name,
+                )
+            summary.duplicates_removed += 1
+            return
+
         metadata_matches = self._resolved_metadata_matches(existing_tags, tags)
         if metadata_matches and existing == base_destination:
             if self.settings.dry_run:

@@ -320,12 +320,16 @@ def test_long_album_upload_is_deferred_for_manual_approval(
 
     summary = processor.process_pending()
 
-    assert summary.deferred == 1
-    assert summary.imported == 0
+    assert summary.deferred == 0
+    assert summary.imported == 1
     assert musicbrainz.calls == []
     assert musicbrainz.release_calls == []
-    assert written == []
-    assert uploaded.exists()
+    assert len(written) == 1
+    assert written[0].review_status == "pending"
+    assert written[0].review_reason
+
+    assert not uploaded.exists()
+    assert list(processor.settings.library.rglob("*.mp3"))
 
 
 def test_title_artist_replaces_uploader_for_fingerprinting(
@@ -408,11 +412,15 @@ def test_low_confidence_fingerprint_is_deferred(
 
     summary = processor.process_pending()
 
-    assert summary.deferred == 1
-    assert summary.imported == 0
+    assert summary.deferred == 0
+    assert summary.imported == 1
     assert summary.quarantined == 0
-    assert uploaded.read_bytes() == b"audio"
-    assert written == []
+    assert not uploaded.exists()
+    assert list(processor.settings.library.rglob("*.mp3"))
+    assert len(written) == 1
+    assert written[0].review_status == "pending"
+    assert written[0].review_reason
+
 
 
 @pytest.mark.parametrize(
@@ -529,6 +537,149 @@ def test_same_source_with_improved_metadata_relocates_existing_file(
     record = processor.source_registry.lookup(source_url)
     assert record is not None
     assert record.path == destination
+
+
+def test_pending_download_cannot_replace_existing_approved_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = make_processor(tmp_path, source_db=tmp_path / "state" / "sources.db")
+    uploaded = processor.settings.uploads / "Artist - Uncertain Title.mp3"
+    uploaded.write_bytes(b"repeat")
+    existing = processor.settings.library / "Artist" / "Album" / "Title.mp3"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"approved-original")
+    source_url = "https://youtu.be/video-id"
+    processor.source_registry.register(source_url, existing, "same")
+
+    def tags_for(path: Path) -> Tags:
+        if path == uploaded:
+            return Tags(
+                artist="Artist",
+                album="Uncertain Album",
+                title="Uncertain Title",
+                source_url=source_url,
+                review_status="pending",
+                review_reason="Low confidence fingerprint",
+            )
+        return Tags(
+            artist="Artist",
+            album="Album",
+            title="Title",
+            source_url=source_url,
+            approved=True,
+        )
+
+    monkeypatch.setattr("music_processor.processor.read_tags", tags_for)
+    monkeypatch.setattr("music_processor.processor.acoustic_content_digest", lambda path: "same")
+    monkeypatch.setattr(
+        "music_processor.processor.write_tags",
+        lambda path, tags: pytest.fail("existing approved source must not be retagged"),
+    )
+
+    summary = processor.process_pending()
+
+    assert summary.duplicates_removed == 1
+    assert summary.sources_updated == 0
+    assert not uploaded.exists()
+    assert existing.read_bytes() == b"approved-original"
+
+
+def test_approved_download_replaces_existing_pending_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = make_processor(tmp_path, source_db=tmp_path / "state" / "sources.db")
+    uploaded = processor.settings.uploads / "Artist - Approved Title.mp3"
+    uploaded.write_bytes(b"approved-audio")
+    existing = processor.settings.library / "Artist" / "Pending Album" / "Pending Title.mp3"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"pending-audio")
+    source_url = "https://youtu.be/video-id"
+    processor.source_registry.register(source_url, existing, "same")
+
+    def tags_for(path: Path) -> Tags:
+        if path == uploaded:
+            return Tags(
+                artist="Artist",
+                album="Approved Album",
+                title="Approved Title",
+                source_url=source_url,
+                approved=True,
+            )
+        return Tags(
+            artist="Artist",
+            album="Pending Album",
+            title="Pending Title",
+            source_url=source_url,
+            review_status="pending",
+            review_reason="No reliable metadata match",
+        )
+
+    monkeypatch.setattr("music_processor.processor.read_tags", tags_for)
+    monkeypatch.setattr("music_processor.processor.acoustic_content_digest", lambda path: "same")
+    monkeypatch.setattr("music_processor.processor.write_tags", lambda path, tags: None)
+
+    summary = processor.process_pending()
+
+    destination = processor.settings.library / "Artist" / "Approved Album" / "Approved Title.mp3"
+    assert summary.sources_updated == 1
+    assert not existing.exists()
+    assert destination.read_bytes() == b"approved-audio"
+    record = processor.source_registry.lookup(source_url)
+    assert record is not None
+    assert record.path == destination
+
+
+def test_pending_download_preserves_existing_pending_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = make_processor(tmp_path, source_db=tmp_path / "state" / "sources.db")
+    uploaded = processor.settings.uploads / "Artist - Second Uncertain Title.mp3"
+    uploaded.write_bytes(b"repeat")
+    existing = processor.settings.library / "Artist" / "Pending Album" / "Pending Title.mp3"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"original-pending-audio")
+    source_url = "https://youtu.be/video-id"
+    processor.source_registry.register(source_url, existing, "same")
+
+    def tags_for(path: Path) -> Tags:
+        if path == uploaded:
+            return Tags(
+                artist="Artist",
+                album="Another Uncertain Album",
+                title="Another Uncertain Title",
+                source_url=source_url,
+                review_status="pending",
+                review_reason="Low confidence fingerprint",
+            )
+        return Tags(
+            artist="Artist",
+            album="Pending Album",
+            title="Pending Title",
+            source_url=source_url,
+            review_status="pending",
+            review_reason="Original review reason",
+        )
+
+    monkeypatch.setattr("music_processor.processor.read_tags", tags_for)
+    monkeypatch.setattr(
+        "music_processor.processor.acoustic_content_digest",
+        lambda path: "same",
+    )
+    monkeypatch.setattr(
+        "music_processor.processor.write_tags",
+        lambda path, tags: pytest.fail("existing pending source must not be retagged"),
+    )
+
+    summary = processor.process_pending()
+
+    assert summary.duplicates_removed == 1
+    assert summary.sources_updated == 0
+    assert not uploaded.exists()
+    assert existing.read_bytes() == b"original-pending-audio"
+    assert tags_for(existing).review_reason == "Original review reason"
 
 
 def test_same_source_with_different_audio_is_retained_for_review(
@@ -655,10 +806,14 @@ def test_short_self_titled_ep_with_chapters_is_deferred(
 
     summary = processor.process_pending()
 
-    assert summary.deferred == 1
-    assert summary.imported == 0
-    assert written == []
-    assert uploaded.exists()
+    assert summary.deferred == 0
+    assert summary.imported == 1
+    assert len(written) == 1
+    assert written[0].review_status == "pending"
+    assert written[0].review_reason
+
+    assert not uploaded.exists()
+    assert list(processor.settings.library.rglob("*.mp3"))
 
 
 def test_chaptered_release_without_match_is_deferred(
@@ -682,10 +837,14 @@ def test_chaptered_release_without_match_is_deferred(
 
     summary = processor.process_pending()
 
-    assert summary.deferred == 1
-    assert summary.imported == 0
-    assert written == []
-    assert uploaded.exists()
+    assert summary.deferred == 0
+    assert summary.imported == 1
+    assert len(written) == 1
+    assert written[0].review_status == "pending"
+    assert written[0].review_reason
+
+    assert not uploaded.exists()
+    assert list(processor.settings.library.rglob("*.mp3"))
 
 
 def test_three_part_song_title_without_approval_is_deferred(
@@ -710,10 +869,14 @@ def test_three_part_song_title_without_approval_is_deferred(
 
     summary = processor.process_pending()
 
-    assert summary.deferred == 1
-    assert summary.imported == 0
-    assert written == []
-    assert uploaded.exists()
+    assert summary.deferred == 0
+    assert summary.imported == 1
+    assert len(written) == 1
+    assert written[0].review_status == "pending"
+    assert written[0].review_reason
+
+    assert not uploaded.exists()
+    assert list(processor.settings.library.rglob("*.mp3"))
 
 
 def test_release_upload_without_approval_is_deferred(
@@ -738,12 +901,16 @@ def test_release_upload_without_approval_is_deferred(
 
     summary = processor.process_pending()
 
-    assert summary.deferred == 1
-    assert summary.imported == 0
+    assert summary.deferred == 0
+    assert summary.imported == 1
     assert musicbrainz.calls == []
     assert musicbrainz.release_calls == []
-    assert written == []
-    assert uploaded.exists()
+    assert len(written) == 1
+    assert written[0].review_status == "pending"
+    assert written[0].review_reason
+
+    assert not uploaded.exists()
+    assert list(processor.settings.library.rglob("*.mp3"))
 
 
 def test_ambiguous_filename_artist_without_approval_is_deferred(
@@ -773,12 +940,16 @@ def test_ambiguous_filename_artist_without_approval_is_deferred(
 
     summary = processor.process_pending()
 
-    assert summary.deferred == 1
-    assert summary.imported == 0
+    assert summary.deferred == 0
+    assert summary.imported == 1
     assert musicbrainz.calls == []
     assert musicbrainz.release_calls == []
-    assert written == []
-    assert uploaded.exists()
+    assert len(written) == 1
+    assert written[0].review_status == "pending"
+    assert written[0].review_reason
+
+    assert not uploaded.exists()
+    assert list(processor.settings.library.rglob("*.mp3"))
 
 
 def test_filename_artist_spelling_without_approval_is_deferred(
@@ -799,12 +970,16 @@ def test_filename_artist_spelling_without_approval_is_deferred(
 
     summary = processor.process_pending()
 
-    assert summary.deferred == 1
-    assert summary.imported == 0
+    assert summary.deferred == 0
+    assert summary.imported == 1
     assert musicbrainz.calls == []
     assert musicbrainz.release_calls == []
-    assert written == []
-    assert uploaded.exists()
+    assert len(written) == 1
+    assert written[0].review_status == "pending"
+    assert written[0].review_reason
+
+    assert not uploaded.exists()
+    assert list(processor.settings.library.rglob("*.mp3"))
 
 
 def test_cross_filesystem_replacement_is_staged_before_overwrite(
